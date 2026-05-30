@@ -1,0 +1,13 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Installed dependencies
+node_modules/
+
+# Runtime-generated files
+uploads/
+
+# OS metadata
+.DS_Store
