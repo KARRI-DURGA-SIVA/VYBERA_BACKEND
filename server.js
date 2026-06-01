@@ -97,6 +97,79 @@ const publicUser = (user) => ({
   profileImageStorage: user.profile_image_storage,
 });
 
+const publicCreator = (creator) => ({
+  id: creator.id,
+  name: creator.name,
+  email: creator.email,
+  phone: creator.phone,
+  category: creator.category,
+  about: creator.about,
+  kycStatus: creator.kyc_status,
+  joinedAt: creator.created_at,
+});
+
+const publicCreatorEvent = (event) => ({
+  id: event.id,
+  creatorId: event.creator_id,
+  creatorName: event.creator_name,
+  name: event.name,
+  category: event.category,
+  description: event.description,
+  date: event.event_date,
+  time: event.start_time,
+  endTime: event.end_time,
+  venue: event.venue,
+  city: event.city,
+  capacity: event.capacity,
+  latitude: event.latitude,
+  longitude: event.longitude,
+  banner: event.banner_url,
+  bannerKey: event.banner_key,
+  visibility: event.visibility,
+  status: event.status,
+  tickets: event.tickets || [],
+  bookingCount: Number(event.booking_count || 0),
+  revenue: Number(event.revenue || 0),
+  checkins: Number(event.checkins || 0),
+  createdAt: event.created_at,
+});
+
+const publicAdmin = (admin) => ({
+  id: admin.id,
+  name: admin.name,
+  email: admin.email,
+  role: admin.role,
+  status: admin.status,
+  lastLogin: admin.last_login,
+  createdAt: admin.created_at,
+});
+
+const requireCreator = (req, res, next) => {
+  try {
+    const auth = req.headers.authorization || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    const payload = verifyJwt(token);
+    if (payload.scope !== "creator") throw new Error("Creator login required");
+    req.creator = payload;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: err.message || "Creator login required" });
+  }
+};
+
+const requireAdmin = (req, res, next) => {
+  try {
+    const auth = req.headers.authorization || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    const payload = verifyJwt(token);
+    if (payload.scope !== "admin") throw new Error("Admin login required");
+    req.admin = payload;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: err.message || "Admin login required" });
+  }
+};
+
 const getSigningKey = (secret, dateStamp) => {
   const kDate = hmac(`AWS4${secret}`, dateStamp);
   const kRegion = hmac(kDate, "auto");
@@ -272,6 +345,129 @@ const initDb = async () => {
       booked_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS creator_accounts (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      phone TEXT NOT NULL,
+      category TEXT NOT NULL,
+      about TEXT NOT NULL,
+      password TEXT NOT NULL,
+      kyc_status TEXT NOT NULL DEFAULT 'Pending',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS creator_kyc_documents (
+      id SERIAL PRIMARY KEY,
+      creator_id INTEGER NOT NULL REFERENCES creator_accounts(id) ON DELETE CASCADE,
+      document_type TEXT NOT NULL,
+      file_name TEXT NOT NULL,
+      object_key TEXT NOT NULL,
+      storage TEXT NOT NULL,
+      content_type TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS creator_events (
+      id TEXT PRIMARY KEY,
+      creator_id INTEGER NOT NULL REFERENCES creator_accounts(id) ON DELETE CASCADE,
+      creator_name TEXT NOT NULL,
+      name TEXT NOT NULL,
+      category TEXT NOT NULL,
+      description TEXT NOT NULL,
+      event_date TEXT NOT NULL,
+      start_time TEXT NOT NULL,
+      end_time TEXT,
+      venue TEXT NOT NULL,
+      city TEXT NOT NULL,
+      capacity INTEGER NOT NULL,
+      latitude NUMERIC,
+      longitude NUMERIC,
+      banner_url TEXT NOT NULL,
+      banner_key TEXT NOT NULL,
+      visibility TEXT NOT NULL DEFAULT 'Public',
+      status TEXT NOT NULL DEFAULT 'live',
+      tickets JSONB NOT NULL DEFAULT '[]'::jsonb,
+      booking_count INTEGER NOT NULL DEFAULT 0,
+      revenue NUMERIC NOT NULL DEFAULT 0,
+      checkins INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS admin_accounts (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'Super Admin',
+      status TEXT NOT NULL DEFAULT 'Active',
+      last_login TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS staff_accounts (
+      id TEXT PRIMARY KEY,
+      creator_id INTEGER REFERENCES creator_accounts(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      staff_id TEXT UNIQUE NOT NULL,
+      email TEXT,
+      phone TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      assigned_tickets INTEGER NOT NULL DEFAULT 0,
+      sold_tickets INTEGER NOT NULL DEFAULT 0,
+      earnings NUMERIC NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS payment_transactions (
+      txnid TEXT PRIMARY KEY,
+      booking_id TEXT,
+      event_id TEXT,
+      ticket_type TEXT,
+      qty INTEGER,
+      buyer_email TEXT,
+      amount NUMERIC NOT NULL DEFAULT 0,
+      gateway_payment_id TEXT,
+      status TEXT NOT NULL DEFAULT 'Pending',
+      verified BOOLEAN NOT NULL DEFAULT FALSE,
+      error TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  const superAdminEmail = String(process.env.SUPERADMIN_EMAIL || "superadmin@vybera.in").trim().toLowerCase();
+  const superAdminPassword = process.env.SUPERADMIN_PASSWORD;
+  if (!superAdminPassword) {
+    throw new Error("SUPERADMIN_PASSWORD is missing. Add it to VYBERA/.env before starting the server.");
+  }
+  const existingAdmin = await pool.query("SELECT id, password FROM admin_accounts WHERE email=$1", [superAdminEmail]);
+  const passwordMatches = existingAdmin.rows[0]
+    ? await bcrypt.compare(superAdminPassword, existingAdmin.rows[0].password)
+    : false;
+  const passwordHash = passwordMatches ? existingAdmin.rows[0].password : await bcrypt.hash(superAdminPassword, 10);
+  await pool.query(
+    `INSERT INTO admin_accounts (name, email, password, role, status)
+     VALUES ($1,$2,$3,'Super Admin','Active')
+     ON CONFLICT (email) DO UPDATE SET
+       name=EXCLUDED.name,
+       password=EXCLUDED.password,
+       role=EXCLUDED.role,
+       status=EXCLUDED.status`,
+    ["Vybera Super Admin", superAdminEmail, passwordHash]
+  );
 };
 
 initDb().catch((err) => {
@@ -408,6 +604,345 @@ app.post("/assets/upload", async (req, res) => {
   }
 });
 
+app.post("/creator/applications", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { name, email, phone, category, about, password, documents } = req.body || {};
+    const cleanName = String(name || "").trim();
+    const cleanEmail = String(email || "").trim().toLowerCase();
+    const cleanPhone = String(phone || "").trim();
+    const cleanCategory = String(category || "").trim();
+    const cleanAbout = String(about || "").trim();
+    const cleanPassword = String(password || "");
+    const files = Array.isArray(documents) ? documents : [];
+
+    if (!cleanName || !cleanEmail || !cleanPhone || !cleanCategory || !cleanAbout || !cleanPassword) {
+      return res.status(400).json({ error: "Name, email, phone, event type, about, and password are required" });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return res.status(400).json({ error: "Enter a valid creator email address" });
+    }
+    if (cleanPassword.length < 8) {
+      return res.status(400).json({ error: "Creator password must be at least 8 characters" });
+    }
+    if (!files.length) {
+      return res.status(400).json({ error: "Upload at least one KYC document" });
+    }
+    const existing = await client.query("SELECT 1 FROM creator_accounts WHERE email=$1", [cleanEmail]);
+    if (existing.rows.length) {
+      return res.status(409).json({ error: "A creator account with this email already exists" });
+    }
+
+    const allowedTypes = new Set(["aadhaar", "gst", "bank"]);
+    const uploaded = [];
+    for (const file of files) {
+      const documentType = String(file.documentType || "").trim().toLowerCase();
+      if (!allowedTypes.has(documentType) || !file.fileName || !file.dataUrl) {
+        return res.status(400).json({ error: "Each KYC document must include a valid type, file name, and file data" });
+      }
+      const asset = await saveAsset({
+        fileName: file.fileName,
+        folder: `kyc-documents/${cleanPathSegment(cleanEmail, "creator")}/${documentType}`,
+        dataUrl: file.dataUrl,
+        requireR2: true,
+      });
+      uploaded.push({ documentType, fileName: file.fileName, ...asset });
+    }
+
+    const hashedPassword = await bcrypt.hash(cleanPassword, 10);
+    await client.query("BEGIN");
+    const creatorResult = await client.query(
+      `INSERT INTO creator_accounts (name, email, phone, category, about, password)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING id, name, email, phone, category, about, kyc_status, created_at`,
+      [cleanName, cleanEmail, cleanPhone, cleanCategory, cleanAbout, hashedPassword]
+    );
+    const creator = creatorResult.rows[0];
+    for (const file of uploaded) {
+      await client.query(
+        `INSERT INTO creator_kyc_documents (
+          creator_id, document_type, file_name, object_key, storage, content_type
+        ) VALUES ($1,$2,$3,$4,$5,$6)`,
+        [creator.id, file.documentType, file.fileName, file.key, file.storage, file.contentType]
+      );
+    }
+    await client.query("COMMIT");
+    res.status(201).json({
+      message: "Creator application and KYC submitted successfully. Sign in with your creator email and password.",
+      creator: publicCreator(creator),
+    });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("Creator application failed:", err);
+    if (err.code === "23505") {
+      return res.status(409).json({ error: "A creator account with this email already exists" });
+    }
+    res.status(500).json({ error: err.message || "Creator application failed" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/creator/login", async (req, res) => {
+  try {
+    const cleanEmail = String((req.body && req.body.email) || "").trim().toLowerCase();
+    const password = String((req.body && req.body.password) || "");
+    if (!cleanEmail || !password) {
+      return res.status(400).json({ error: "Creator email and password are required" });
+    }
+    const result = await pool.query(
+      `SELECT id, name, email, phone, category, about, password, kyc_status, created_at
+       FROM creator_accounts
+       WHERE email=$1`,
+      [cleanEmail]
+    );
+    if (!result.rows.length || !(await bcrypt.compare(password, result.rows[0].password))) {
+      return res.status(401).json({ error: "Invalid creator email or password" });
+    }
+    const creator = result.rows[0];
+    res.json({
+      message: "Creator login successful",
+      creator: publicCreator(creator),
+      token: signJwt({ sub: creator.id, email: creator.email, scope: "creator" }),
+      expiresInDays: 30,
+    });
+  } catch (err) {
+    console.error("Creator login failed:", err);
+    res.status(500).json({ error: "Creator login failed" });
+  }
+});
+
+app.get("/creator/events", requireCreator, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM creator_events WHERE creator_id=$1 ORDER BY created_at DESC`,
+      [req.creator.sub]
+    );
+    res.json({ events: result.rows.map(publicCreatorEvent) });
+  } catch (err) {
+    console.error("Creator events list failed:", err);
+    res.status(500).json({ error: "Could not load creator events" });
+  }
+});
+
+app.get("/events", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM creator_events
+       WHERE status='live' AND visibility='Public'
+       ORDER BY created_at DESC`
+    );
+    res.json({ events: result.rows.map(publicCreatorEvent) });
+  } catch (err) {
+    console.error("Public events list failed:", err);
+    res.status(500).json({ error: "Could not load events" });
+  }
+});
+
+app.post("/creator/events/banner", requireCreator, async (req, res) => {
+  try {
+    const { fileName, dataUrl } = req.body || {};
+    if (!fileName || !dataUrl) {
+      return res.status(400).json({ error: "Banner file name and data are required" });
+    }
+    const asset = await saveAsset({
+      fileName,
+      folder: `event-banners/creator-${req.creator.sub}`,
+      dataUrl,
+      requireR2: true,
+    });
+    res.status(201).json(asset);
+  } catch (err) {
+    console.error("Creator banner upload failed:", err);
+    res.status(500).json({ error: err.message || "Banner upload failed" });
+  }
+});
+
+app.post("/creator/events", requireCreator, async (req, res) => {
+  try {
+    const {
+      name, category, description, date, time, endTime, venue, city, capacity,
+      latitude, longitude, banner, bannerKey, visibility, tickets,
+    } = req.body || {};
+    const cleanTickets = Array.isArray(tickets) ? tickets.map((ticket) => ({
+      name: String(ticket.name || "").trim(),
+      price: Number(ticket.price || 0),
+      qty: Number(ticket.qty || 0),
+      perks: String(ticket.perks || "").trim(),
+    })).filter((ticket) => ticket.name && ticket.qty > 0 && ticket.price >= 0) : [];
+    if (!name || !category || !description || !date || !time || !venue || !city || !Number(capacity)) {
+      return res.status(400).json({ error: "Complete the event details, date, time, venue, city, and capacity" });
+    }
+    if (!banner || !bannerKey) {
+      return res.status(400).json({ error: "Upload an event banner before publishing" });
+    }
+    if (!cleanTickets.length) {
+      return res.status(400).json({ error: "Add at least one valid ticket tier" });
+    }
+    const creatorResult = await pool.query("SELECT name FROM creator_accounts WHERE id=$1", [req.creator.sub]);
+    if (!creatorResult.rows.length) return res.status(401).json({ error: "Creator account not found" });
+    const id = `EVT-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
+    const result = await pool.query(
+      `INSERT INTO creator_events (
+        id, creator_id, creator_name, name, category, description, event_date,
+        start_time, end_time, venue, city, capacity, latitude, longitude,
+        banner_url, banner_key, visibility, tickets
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+      RETURNING *`,
+      [
+        id, req.creator.sub, creatorResult.rows[0].name, String(name).trim(),
+        String(category).trim(), String(description).trim(), String(date).trim(),
+        String(time).trim(), String(endTime || "").trim() || null, String(venue).trim(),
+        String(city).trim(), Number(capacity), latitude || null, longitude || null,
+        String(banner), String(bannerKey), String(visibility || "Public"), JSON.stringify(cleanTickets),
+      ]
+    );
+    if (!result.rows.length) {
+      throw new Error("Event was not saved in the database");
+    }
+    res.status(201).json({ message: "Event published successfully", event: publicCreatorEvent(result.rows[0]) });
+  } catch (err) {
+    console.error("Creator event publish failed:", err);
+    res.status(500).json({ error: err.message || "Event publish failed" });
+  }
+});
+
+app.post("/admin/login", async (req, res) => {
+  try {
+    const email = String((req.body && req.body.email) || "").trim().toLowerCase();
+    const password = String((req.body && req.body.password) || "");
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email and password are required" });
+    }
+    const result = await pool.query("SELECT * FROM admin_accounts WHERE email=$1", [email]);
+    const admin = result.rows[0];
+    if (!admin || admin.status !== "Active" || !(await bcrypt.compare(password, admin.password))) {
+      return res.status(401).json({ error: "Invalid admin email or password" });
+    }
+    const updated = await pool.query(
+      "UPDATE admin_accounts SET last_login=NOW() WHERE id=$1 RETURNING *",
+      [admin.id]
+    );
+    res.json({
+      message: "Admin login successful",
+      admin: publicAdmin(updated.rows[0]),
+      token: signJwt({ sub: admin.id, email: admin.email, scope: "admin" }),
+    });
+  } catch (err) {
+    console.error("Admin login failed:", err);
+    res.status(500).json({ error: "Admin login failed" });
+  }
+});
+
+app.get("/admin/snapshot", requireAdmin, async (req, res) => {
+  try {
+    const [buyers, creators, events, bookings, payments, staff] = await Promise.all([
+      pool.query(`
+        SELECT u.id, u.username, u.first_name, u.last_name, u.email, u.city, u.created_at,
+          COUNT(b.id)::INTEGER AS bookings
+        FROM users u
+        LEFT JOIN bookings b ON b.user_id=u.id OR (b.user_id IS NULL AND LOWER(b.buyer_email)=LOWER(u.email))
+        GROUP BY u.id
+        ORDER BY u.created_at DESC
+      `),
+      pool.query(`
+        SELECT c.id, c.name, c.email, c.phone, c.category, c.kyc_status, c.created_at,
+          COUNT(DISTINCT e.id)::INTEGER AS events,
+          COALESCE(SUM(b.total),0)::NUMERIC AS revenue
+        FROM creator_accounts c
+        LEFT JOIN creator_events e ON e.creator_id=c.id
+        LEFT JOIN bookings b ON b.event_id=e.id
+        GROUP BY c.id
+        ORDER BY c.created_at DESC
+      `),
+      pool.query(`
+        SELECT e.*,
+          COALESCE(SUM(b.qty),0)::INTEGER AS booking_count,
+          COALESCE(SUM(b.total),0)::NUMERIC AS revenue
+        FROM creator_events e
+        LEFT JOIN bookings b ON b.event_id=e.id
+        GROUP BY e.id
+        ORDER BY e.created_at DESC
+      `),
+      pool.query("SELECT * FROM bookings ORDER BY booked_at DESC"),
+      pool.query("SELECT * FROM payment_transactions ORDER BY updated_at DESC"),
+      pool.query("SELECT * FROM staff_accounts ORDER BY created_at DESC"),
+    ]);
+    res.json({
+      buyers: buyers.rows.map((buyer) => ({
+        id: `USR-${buyer.id}`,
+        name: buyer.username || [buyer.first_name, buyer.last_name].filter(Boolean).join(" ") || buyer.email,
+        email: buyer.email,
+        city: buyer.city || "",
+        bookings: Number(buyer.bookings || 0),
+        status: "Active",
+        createdAt: buyer.created_at,
+      })),
+      creators: creators.rows.map((creator) => ({
+        id: `CRT-${creator.id}`,
+        creatorId: creator.id,
+        name: creator.name,
+        email: creator.email,
+        phone: creator.phone,
+        category: creator.category,
+        status: creator.kyc_status,
+        events: Number(creator.events || 0),
+        revenue: Number(creator.revenue || 0),
+        fee: 6,
+        createdAt: creator.created_at,
+      })),
+      events: events.rows.map(publicCreatorEvent),
+      bookings: bookings.rows.map((booking) => ({
+        id: booking.id,
+        userId: booking.user_id,
+        buyerEmail: booking.buyer_email,
+        buyer: booking.buyer_email || "Buyer",
+        eventId: booking.event_id,
+        eventName: booking.event_name,
+        eventDate: booking.event_date,
+        eventVenue: booking.event_venue,
+        eventBanner: booking.event_banner,
+        ticketType: booking.ticket_type,
+        price: Number(booking.price || 0),
+        qty: Number(booking.qty || 0),
+        total: Number(booking.total || 0),
+        status: booking.status,
+        bookedAt: booking.booked_at,
+      })),
+      payments: payments.rows.map((payment) => ({
+        txnid: payment.txnid,
+        bookingId: payment.booking_id,
+        eventId: payment.event_id,
+        ticketType: payment.ticket_type,
+        qty: Number(payment.qty || 0),
+        buyerEmail: payment.buyer_email,
+        amount: Number(payment.amount || 0),
+        gatewayPaymentId: payment.gateway_payment_id,
+        status: payment.status,
+        verified: payment.verified,
+        error: payment.error,
+        updatedAt: payment.updated_at,
+      })),
+      staff: staff.rows.map((member) => ({
+        id: member.id,
+        creatorId: member.creator_id,
+        name: member.name,
+        staffId: member.staff_id,
+        email: member.email,
+        phone: member.phone,
+        status: member.status,
+        assignedTickets: Number(member.assigned_tickets || 0),
+        soldTickets: Number(member.sold_tickets || 0),
+        earnings: Number(member.earnings || 0),
+        createdAt: member.created_at,
+      })),
+    });
+  } catch (err) {
+    console.error("Admin snapshot failed:", err);
+    res.status(500).json({ error: "Could not load admin data" });
+  }
+});
+
 app.get("/r2/media/*key", (req, res) => {
   try {
     const key = Array.isArray(req.params.key) ? req.params.key.join("/") : req.params.key;
@@ -504,6 +1039,42 @@ const makePayuResponseHash = (fields) => {
   return crypto.createHash("sha512").update(hashString).digest("hex");
 };
 
+const savePaymentTransaction = async (fields, status, verified, error = "") => {
+  const txnid = String(fields.txnid || "").trim();
+  if (!txnid) return;
+  await pool.query(
+    `INSERT INTO payment_transactions (
+      txnid, booking_id, event_id, ticket_type, qty, buyer_email, amount,
+      gateway_payment_id, status, verified, error, updated_at
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+    ON CONFLICT (txnid) DO UPDATE SET
+      booking_id=COALESCE(EXCLUDED.booking_id, payment_transactions.booking_id),
+      event_id=COALESCE(EXCLUDED.event_id, payment_transactions.event_id),
+      ticket_type=COALESCE(EXCLUDED.ticket_type, payment_transactions.ticket_type),
+      qty=COALESCE(EXCLUDED.qty, payment_transactions.qty),
+      buyer_email=COALESCE(EXCLUDED.buyer_email, payment_transactions.buyer_email),
+      amount=EXCLUDED.amount,
+      gateway_payment_id=COALESCE(EXCLUDED.gateway_payment_id, payment_transactions.gateway_payment_id),
+      status=EXCLUDED.status,
+      verified=EXCLUDED.verified,
+      error=EXCLUDED.error,
+      updated_at=NOW()`,
+    [
+      txnid,
+      fields.udf1 || null,
+      fields.udf2 || null,
+      fields.udf3 || null,
+      Number(fields.udf4 || 0) || null,
+      fields.email || null,
+      Number(fields.amount || 0),
+      fields.mihpayid || null,
+      status,
+      Boolean(verified),
+      error || null,
+    ]
+  );
+};
+
 const payuReturnHtml = (result) => `<!doctype html>
 <html><head><meta charset="utf-8"><title>VYBERA Payment</title></head>
 <body style="background:#000;color:#fff;font-family:Arial,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;">
@@ -514,7 +1085,7 @@ window.location.href = '/';
 </script>
 </body></html>`;
 
-app.post("/payments/payu/initiate", (req, res) => {
+app.post("/payments/payu/initiate", async (req, res) => {
   try {
     if (!payuConfig.key || !payuConfig.salt) {
       return res.status(500).json({ error: "PAYU_KEY and PAYU_SALT must be configured" });
@@ -545,6 +1116,7 @@ app.post("/payments/payu/initiate", (req, res) => {
       service_provider: "payu_paisa",
     };
     fields.hash = makePayuHash(fields);
+    await savePaymentTransaction(fields, "Pending", false);
     res.json({ action: payuConfig.action, fields });
   } catch (err) {
     console.error("PayU initiation failed:", err);
@@ -552,11 +1124,12 @@ app.post("/payments/payu/initiate", (req, res) => {
   }
 });
 
-app.post("/payments/payu/success", (req, res) => {
+app.post("/payments/payu/success", async (req, res) => {
   try {
     const body = req.body || {};
     const expected = makePayuResponseHash(body);
     const verified = Boolean(body.hash) && expected === body.hash;
+    await savePaymentTransaction(body, verified ? "Success" : "Failed", verified, verified ? "" : "Payment signature could not be verified");
     res.send(payuReturnHtml({
       verified,
       status: body.status || "success",
@@ -575,13 +1148,14 @@ app.post("/payments/payu/success", (req, res) => {
   }
 });
 
-app.post("/payments/payu/failure", (req, res) => {
+app.post("/payments/payu/failure", async (req, res) => {
   try {
     const body = req.body || {};
     let verified = false;
     if (body.hash && payuConfig.salt) {
       verified = makePayuResponseHash(body) === body.hash;
     }
+    await savePaymentTransaction(body, "Failed", verified, body.error_Message || body.error || "Payment failed");
     res.send(payuReturnHtml({
       verified,
       status: body.status || "failed",
