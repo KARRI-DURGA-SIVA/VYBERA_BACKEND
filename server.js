@@ -6,6 +6,7 @@ const bodyParser = require("body-parser");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
 const crypto = require("crypto");
+const QRCode = require("qrcode");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const app = express();
@@ -134,6 +135,43 @@ const publicCreatorEvent = (event) => ({
   createdAt: event.created_at,
 });
 
+const creatorEventSalesQuery = `
+  SELECT e.*,
+    COALESCE(SUM(CASE WHEN b.status <> 'refunded' THEN b.qty ELSE 0 END),0)::INTEGER AS booking_count,
+    COALESCE(SUM(CASE WHEN b.status <> 'refunded' THEN b.total ELSE 0 END),0)::NUMERIC AS revenue
+  FROM creator_events e
+  LEFT JOIN bookings b ON b.event_id=e.id
+`;
+
+const publicStaffAssignment = (assignment) => ({
+  id: assignment.id,
+  staffPk: assignment.staff_id,
+  eventId: assignment.event_id,
+  eventName: assignment.event_name,
+  tierName: assignment.tier_name,
+  qty: Number(assignment.qty || 0),
+  soldCount: Number(assignment.sold_count || 0),
+  price: Number(assignment.price || 0),
+  assignedAt: assignment.created_at,
+});
+
+const publicStaff = (member) => ({
+  id: member.id,
+  creatorId: member.creator_id,
+  name: member.name,
+  staffId: member.staff_id,
+  email: member.email,
+  phone: member.phone,
+  role: member.role,
+  assignedGate: member.assigned_gate,
+  gates: member.assigned_gate ? [member.assigned_gate] : [],
+  status: member.status,
+  assignedTickets: Number(member.assigned_tickets || 0),
+  soldTickets: Number(member.sold_tickets || 0),
+  earnings: Number(member.earnings || 0),
+  createdAt: member.created_at,
+});
+
 const publicAdmin = (admin) => ({
   id: admin.id,
   name: admin.name,
@@ -167,6 +205,19 @@ const requireAdmin = (req, res, next) => {
     next();
   } catch (err) {
     res.status(401).json({ error: err.message || "Admin login required" });
+  }
+};
+
+const requireBuyer = (req, res, next) => {
+  try {
+    const auth = req.headers.authorization || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    const payload = verifyJwt(token);
+    if (!payload.sub || payload.scope) throw new Error("Buyer login required");
+    req.buyer = payload;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: err.message || "Buyer login required" });
   }
 };
 
@@ -347,6 +398,13 @@ const initDb = async () => {
   `);
 
   await pool.query(`
+    ALTER TABLE bookings
+      ADD COLUMN IF NOT EXISTS buyer_name TEXT,
+      ADD COLUMN IF NOT EXISTS qr_token TEXT,
+      ADD COLUMN IF NOT EXISTS scanned_at TIMESTAMPTZ
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS creator_accounts (
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
@@ -358,6 +416,11 @@ const initDb = async () => {
       kyc_status TEXT NOT NULL DEFAULT 'Pending',
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
+  `);
+
+  await pool.query(`
+    ALTER TABLE creator_accounts
+      ADD COLUMN IF NOT EXISTS finance_pin TEXT
   `);
 
   await pool.query(`
@@ -431,6 +494,28 @@ const initDb = async () => {
   `);
 
   await pool.query(`
+    ALTER TABLE staff_accounts
+      ADD COLUMN IF NOT EXISTS password TEXT,
+      ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'Scanner',
+      ADD COLUMN IF NOT EXISTS assigned_gate TEXT
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS staff_assignments (
+      id TEXT PRIMARY KEY,
+      creator_id INTEGER NOT NULL REFERENCES creator_accounts(id) ON DELETE CASCADE,
+      staff_id TEXT NOT NULL REFERENCES staff_accounts(id) ON DELETE CASCADE,
+      event_id TEXT NOT NULL REFERENCES creator_events(id) ON DELETE CASCADE,
+      event_name TEXT NOT NULL,
+      tier_name TEXT NOT NULL,
+      qty INTEGER NOT NULL,
+      sold_count INTEGER NOT NULL DEFAULT 0,
+      price NUMERIC NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS payment_transactions (
       txnid TEXT PRIMARY KEY,
       booking_id TEXT,
@@ -448,10 +533,26 @@ const initDb = async () => {
     )
   `);
 
+  await pool.query(`
+    UPDATE creator_events e SET
+      booking_count=COALESCE(s.tickets,0),
+      revenue=COALESCE(s.revenue,0)
+    FROM (
+      SELECT event_id,
+        COALESCE(SUM(CASE WHEN status <> 'refunded' THEN qty ELSE 0 END),0)::INTEGER AS tickets,
+        COALESCE(SUM(CASE WHEN status <> 'refunded' THEN total ELSE 0 END),0)::NUMERIC AS revenue
+      FROM bookings
+      WHERE event_id IS NOT NULL
+      GROUP BY event_id
+    ) s
+    WHERE e.id=s.event_id
+  `);
+
   const superAdminEmail = String(process.env.SUPERADMIN_EMAIL || "superadmin@vybera.in").trim().toLowerCase();
   const superAdminPassword = process.env.SUPERADMIN_PASSWORD;
   if (!superAdminPassword) {
-    throw new Error("SUPERADMIN_PASSWORD is missing. Add it to VYBERA/.env before starting the server.");
+    console.warn("SUPERADMIN_PASSWORD is missing. Skipping super-admin account bootstrap.");
+    return;
   }
   const existingAdmin = await pool.query("SELECT id, password FROM admin_accounts WHERE email=$1", [superAdminEmail]);
   const passwordMatches = existingAdmin.rows[0]
@@ -715,7 +816,10 @@ app.post("/creator/login", async (req, res) => {
 app.get("/creator/events", requireCreator, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT * FROM creator_events WHERE creator_id=$1 ORDER BY created_at DESC`,
+      `${creatorEventSalesQuery}
+       WHERE e.creator_id=$1
+       GROUP BY e.id
+       ORDER BY e.created_at DESC`,
       [req.creator.sub]
     );
     res.json({ events: result.rows.map(publicCreatorEvent) });
@@ -728,9 +832,10 @@ app.get("/creator/events", requireCreator, async (req, res) => {
 app.get("/events", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT * FROM creator_events
-       WHERE status='live' AND visibility='Public'
-       ORDER BY created_at DESC`
+      `${creatorEventSalesQuery}
+       WHERE e.status='live' AND e.visibility='Public'
+       GROUP BY e.id
+       ORDER BY e.created_at DESC`
     );
     res.json({ events: result.rows.map(publicCreatorEvent) });
   } catch (err) {
@@ -804,6 +909,214 @@ app.post("/creator/events", requireCreator, async (req, res) => {
   } catch (err) {
     console.error("Creator event publish failed:", err);
     res.status(500).json({ error: err.message || "Event publish failed" });
+  }
+});
+
+app.get("/creator/staff", requireCreator, async (req, res) => {
+  try {
+    const [staff, assignments] = await Promise.all([
+      pool.query("SELECT * FROM staff_accounts WHERE creator_id=$1 ORDER BY created_at DESC", [req.creator.sub]),
+      pool.query("SELECT * FROM staff_assignments WHERE creator_id=$1 ORDER BY created_at DESC", [req.creator.sub]),
+    ]);
+    res.json({
+      staff: staff.rows.map(publicStaff),
+      assignments: assignments.rows.map(publicStaffAssignment),
+    });
+  } catch (err) {
+    console.error("Creator staff list failed:", err);
+    res.status(500).json({ error: "Could not load staff" });
+  }
+});
+
+app.get("/creator/analytics", requireCreator, async (req, res) => {
+  try {
+    const [summary, events, staff] = await Promise.all([
+      pool.query(
+        `SELECT
+           COALESCE(SUM(CASE WHEN b.status <> 'refunded' THEN b.total ELSE 0 END),0)::NUMERIC AS gross,
+           COALESCE(SUM(CASE WHEN b.status <> 'refunded' THEN b.qty ELSE 0 END),0)::INTEGER AS tickets
+         FROM creator_events e
+         LEFT JOIN bookings b ON b.event_id=e.id
+         WHERE e.creator_id=$1`,
+        [req.creator.sub]
+      ),
+      pool.query(
+        `SELECT e.id, e.name, e.status, e.event_date,
+           COALESCE(SUM(CASE WHEN b.status <> 'refunded' THEN b.total ELSE 0 END),0)::NUMERIC AS revenue,
+           COALESCE(SUM(CASE WHEN b.status <> 'refunded' THEN b.qty ELSE 0 END),0)::INTEGER AS tickets
+         FROM creator_events e
+         LEFT JOIN bookings b ON b.event_id=e.id
+         WHERE e.creator_id=$1
+         GROUP BY e.id
+         ORDER BY e.created_at DESC`,
+        [req.creator.sub]
+      ),
+      pool.query(
+        `SELECT id, name, staff_id, assigned_tickets, sold_tickets, earnings
+         FROM staff_accounts
+         WHERE creator_id=$1
+         ORDER BY earnings DESC, sold_tickets DESC, created_at DESC`,
+        [req.creator.sub]
+      ),
+    ]);
+    const gross = Number(summary.rows[0].gross || 0);
+    const tickets = Number(summary.rows[0].tickets || 0);
+    const fee = Math.round(gross * 0.06);
+    const net = gross - fee;
+    res.json({
+      summary: {
+        gross,
+        fee,
+        net,
+        tickets,
+        averageTicketPrice: tickets ? Math.round(gross / tickets) : 0,
+        payoutStatus: gross > 0 ? "Pending" : "No payout due",
+      },
+      events: events.rows.map((event) => ({
+        id: event.id,
+        name: event.name,
+        status: event.status,
+        date: event.event_date,
+        revenue: Number(event.revenue || 0),
+        tickets: Number(event.tickets || 0),
+      })),
+      staff: staff.rows.map((member) => ({
+        id: member.id,
+        name: member.name,
+        staffId: member.staff_id,
+        assignedTickets: Number(member.assigned_tickets || 0),
+        soldTickets: Number(member.sold_tickets || 0),
+        earnings: Number(member.earnings || 0),
+      })),
+    });
+  } catch (err) {
+    console.error("Creator analytics failed:", err);
+    res.status(500).json({ error: "Could not load creator analytics" });
+  }
+});
+
+app.post("/creator/staff", requireCreator, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { name, phone, email, staffId, password, role, assignedGate, eventId, tierName, qty } = req.body || {};
+    const cleanStaffId = String(staffId || "").trim().toLowerCase();
+    const cleanPassword = String(password || "");
+    if (!name || !cleanStaffId || cleanPassword.length < 6) {
+      return res.status(400).json({ error: "Name, login ID, and a temporary password of at least 6 characters are required" });
+    }
+    await client.query("BEGIN");
+    const id = `STF-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
+    const result = await client.query(
+      `INSERT INTO staff_accounts (id, creator_id, name, staff_id, email, phone, password, role, assigned_gate)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING *`,
+      [
+        id, req.creator.sub, String(name).trim(), cleanStaffId,
+        String(email || "").trim() || null, String(phone || "").trim() || null,
+        await bcrypt.hash(cleanPassword, 10), String(role || "Scanner").trim(),
+        String(assignedGate || "").trim() || null,
+      ]
+    );
+    let assignment = null;
+    if (eventId && tierName && Number(qty) > 0) {
+      assignment = await createStaffAssignment(client, {
+        creatorId: req.creator.sub,
+        staffId: id,
+        eventId,
+        tierName,
+        qty: Number(qty),
+      });
+    }
+    await client.query("COMMIT");
+    res.status(201).json({
+      message: "Staff member added successfully",
+      staff: publicStaff(result.rows[0]),
+      assignment: assignment ? publicStaffAssignment(assignment) : null,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Creator staff create failed:", err);
+    if (err.code === "23505") return res.status(409).json({ error: "Staff login ID is already taken" });
+    res.status(400).json({ error: err.message || "Could not add staff" });
+  } finally {
+    client.release();
+  }
+});
+
+const createStaffAssignment = async (client, { creatorId, staffId, eventId, tierName, qty }) => {
+  const cleanQty = Number(qty);
+  if (!Number.isInteger(cleanQty) || cleanQty < 1) throw new Error("Enter a valid ticket quantity");
+  const staff = await client.query("SELECT id FROM staff_accounts WHERE id=$1 AND creator_id=$2", [staffId, creatorId]);
+  if (!staff.rows.length) throw new Error("Staff member not found");
+  const event = await client.query("SELECT * FROM creator_events WHERE id=$1 AND creator_id=$2 FOR UPDATE", [eventId, creatorId]);
+  if (!event.rows.length) throw new Error("Creator event not found");
+  const tickets = Array.isArray(event.rows[0].tickets) ? event.rows[0].tickets : [];
+  const tier = tickets.find((ticket) => ticket.name === tierName);
+  if (!tier) throw new Error("Ticket tier not found");
+  if (Number(tier.qty || 0) < cleanQty) throw new Error("Not enough tickets available");
+  tier.qty = Number(tier.qty || 0) - cleanQty;
+  await client.query("UPDATE creator_events SET tickets=$1 WHERE id=$2", [JSON.stringify(tickets), eventId]);
+  await client.query("UPDATE staff_accounts SET assigned_tickets=assigned_tickets+$1 WHERE id=$2", [cleanQty, staffId]);
+  const id = `ASN-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
+  const result = await client.query(
+    `INSERT INTO staff_assignments (id, creator_id, staff_id, event_id, event_name, tier_name, qty, price)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+     RETURNING *`,
+    [id, creatorId, staffId, eventId, event.rows[0].name, tierName, cleanQty, Number(tier.price || 0)]
+  );
+  return result.rows[0];
+};
+
+app.post("/creator/staff/:staffId/assignments", requireCreator, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const assignment = await createStaffAssignment(client, {
+      creatorId: req.creator.sub,
+      staffId: req.params.staffId,
+      eventId: req.body && req.body.eventId,
+      tierName: req.body && req.body.tierName,
+      qty: Number(req.body && req.body.qty),
+    });
+    await client.query("COMMIT");
+    res.status(201).json({ message: "Tickets assigned successfully", assignment: publicStaffAssignment(assignment) });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Creator staff assignment failed:", err);
+    res.status(400).json({ error: err.message || "Could not assign tickets" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/creator/finance/unlock", requireCreator, async (req, res) => {
+  try {
+    const pin = String((req.body && req.body.pin) || "").trim();
+    if (!/^\d{4}$/.test(pin)) return res.status(400).json({ error: "Enter a valid 4-digit PIN" });
+    const creator = await pool.query("SELECT finance_pin FROM creator_accounts WHERE id=$1", [req.creator.sub]);
+    if (!creator.rows.length) return res.status(401).json({ error: "Creator account not found" });
+    const hash = creator.rows[0].finance_pin;
+    let initialized = false;
+    if (!hash) {
+      await pool.query("UPDATE creator_accounts SET finance_pin=$1 WHERE id=$2", [await bcrypt.hash(pin, 10), req.creator.sub]);
+      initialized = true;
+    } else if (!(await bcrypt.compare(pin, hash))) {
+      return res.status(401).json({ error: "Incorrect finance PIN" });
+    }
+    const result = await pool.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN b.status <> 'refunded' THEN b.total ELSE 0 END),0)::NUMERIC AS gross,
+         COALESCE(SUM(CASE WHEN b.status <> 'refunded' THEN b.qty ELSE 0 END),0)::INTEGER AS tickets
+       FROM creator_events e
+       LEFT JOIN bookings b ON b.event_id=e.id
+       WHERE e.creator_id=$1`,
+      [req.creator.sub]
+    );
+    const gross = Number(result.rows[0].gross || 0);
+    res.json({ initialized, gross, net: Math.round(gross * 0.94), tickets: Number(result.rows[0].tickets || 0) });
+  } catch (err) {
+    console.error("Creator finance unlock failed:", err);
+    res.status(500).json({ error: "Could not unlock finance" });
   }
 });
 
@@ -1085,6 +1398,30 @@ window.location.href = '/';
 </script>
 </body></html>`;
 
+const makeTicketQrPayload = (bookingId, token) => `VYBERA-TICKET|${bookingId}|${token}`;
+
+const ticketResponse = async (booking) => {
+  const qrPayload = makeTicketQrPayload(booking.id, booking.qr_token);
+  return {
+    id: booking.id,
+    buyerName: booking.buyer_name || booking.buyer_email || "VYBERA Guest",
+    buyerEmail: booking.buyer_email,
+    eventId: booking.event_id,
+    eventName: booking.event_name,
+    eventDate: booking.event_date,
+    eventVenue: booking.event_venue,
+    eventBanner: booking.event_banner,
+    ticketType: booking.ticket_type,
+    price: Number(booking.price || 0),
+    qty: Number(booking.qty || 1),
+    total: Number(booking.total || 0),
+    status: booking.status,
+    scannedAt: booking.scanned_at,
+    qrPayload,
+    qrImage: await QRCode.toDataURL(qrPayload, { width: 320, margin: 2, errorCorrectionLevel: "M" }),
+  };
+};
+
 app.post("/payments/payu/initiate", async (req, res) => {
   try {
     if (!payuConfig.key || !payuConfig.salt) {
@@ -1175,6 +1512,7 @@ app.post("/payments/payu/failure", async (req, res) => {
 });
 
 app.post("/bookings", async (req, res) => {
+  const client = await pool.connect();
   try {
     const booking = req.body || {};
     if (!booking.id) {
@@ -1191,20 +1529,31 @@ app.post("/bookings", async (req, res) => {
       dataUrl: ticketJson,
     });
 
-    await pool.query(
+    await client.query("BEGIN");
+    let userId = booking.userId || null;
+    if (!userId && booking.buyerEmail) {
+      const user = await client.query("SELECT id FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1", [booking.buyerEmail]);
+      userId = user.rows[0] ? user.rows[0].id : null;
+    }
+    const qrToken = crypto.randomBytes(18).toString("hex");
+    const savedBooking = await client.query(
       `INSERT INTO bookings (
-        id, user_id, buyer_email, event_id, event_name, event_date, event_venue,
+        id, user_id, buyer_name, buyer_email, event_id, event_name, event_date, event_venue,
         event_banner, ticket_type, price, qty, total, status,
-        ticket_record_url, ticket_record_key, ticket_record_storage, booked_at
+        ticket_record_url, ticket_record_key, ticket_record_storage, qr_token, booked_at
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
       ON CONFLICT (id) DO UPDATE SET
         ticket_record_url=EXCLUDED.ticket_record_url,
         ticket_record_key=EXCLUDED.ticket_record_key,
-        ticket_record_storage=EXCLUDED.ticket_record_storage`,
+        ticket_record_storage=EXCLUDED.ticket_record_storage,
+        buyer_name=COALESCE(bookings.buyer_name, EXCLUDED.buyer_name),
+        qr_token=COALESCE(bookings.qr_token, EXCLUDED.qr_token)
+      RETURNING *`,
       [
         booking.id,
-        booking.userId || null,
+        userId,
+        booking.buyer || booking.buyerName || null,
         booking.buyerEmail || null,
         booking.eventId || null,
         booking.eventName || null,
@@ -1219,14 +1568,138 @@ app.post("/bookings", async (req, res) => {
         ticketRecord.mediaUrl,
         ticketRecord.key,
         ticketRecord.storage,
+        qrToken,
         booking.bookedAt ? new Date(booking.bookedAt) : new Date(),
       ]
     );
+    if (booking.eventId) {
+      await client.query(
+        `UPDATE creator_events e SET
+           booking_count=COALESCE(s.tickets,0),
+           revenue=COALESCE(s.revenue,0)
+         FROM (
+           SELECT event_id,
+             COALESCE(SUM(CASE WHEN status <> 'refunded' THEN qty ELSE 0 END),0)::INTEGER AS tickets,
+             COALESCE(SUM(CASE WHEN status <> 'refunded' THEN total ELSE 0 END),0)::NUMERIC AS revenue
+           FROM bookings
+           WHERE event_id=$1
+           GROUP BY event_id
+         ) s
+         WHERE e.id=s.event_id`,
+        [booking.eventId]
+      );
+    }
+    await client.query("COMMIT");
 
-    res.json({ booking: { ...booking, ticketRecordUrl: ticketRecord.mediaUrl, r2Key: ticketRecord.key, storage: ticketRecord.storage } });
+    res.json({ booking: await ticketResponse(savedBooking.rows[0]) });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("Booking save failed:", err);
     res.status(500).json({ error: err.message || "Booking save failed" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/bookings/mine", requireBuyer, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT *
+       FROM bookings
+       WHERE user_id=$1 OR (user_id IS NULL AND LOWER(buyer_email)=LOWER($2))
+       ORDER BY booked_at DESC`,
+      [req.buyer.sub, req.buyer.email]
+    );
+    const bookings = await Promise.all(result.rows.map(async (booking) => {
+      if (!booking.qr_token) {
+        const updated = await pool.query(
+          "UPDATE bookings SET qr_token=$1 WHERE id=$2 RETURNING *",
+          [crypto.randomBytes(24).toString("hex"), booking.id]
+        );
+        booking = updated.rows[0];
+      }
+      return ticketResponse(booking);
+    }));
+    res.json({ bookings });
+  } catch (err) {
+    console.error("Buyer booking history failed:", err);
+    res.status(500).json({ error: "Could not load booking history" });
+  }
+});
+
+app.get("/profile/creator-events", requireBuyer, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `${creatorEventSalesQuery}
+       JOIN creator_accounts c ON c.id=e.creator_id
+       WHERE LOWER(c.email)=LOWER($1)
+       GROUP BY e.id
+       ORDER BY e.created_at DESC`,
+      [req.buyer.email]
+    );
+    res.json({ events: result.rows.map(publicCreatorEvent) });
+  } catch (err) {
+    console.error("Profile creator events failed:", err);
+    res.status(500).json({ error: "Could not load your created events" });
+  }
+});
+
+app.get("/bookings/:bookingId/ticket", async (req, res) => {
+  try {
+    const bookingId = String(req.params.bookingId || "").trim();
+    let result = await pool.query("SELECT * FROM bookings WHERE id=$1", [bookingId]);
+    if (!result.rows.length) return res.status(404).json({ error: "Ticket not found" });
+    if (!result.rows[0].qr_token) {
+      result = await pool.query(
+        "UPDATE bookings SET qr_token=$1 WHERE id=$2 RETURNING *",
+        [crypto.randomBytes(18).toString("hex"), bookingId]
+      );
+    }
+    res.json({ booking: await ticketResponse(result.rows[0]) });
+  } catch (err) {
+    console.error("Ticket load failed:", err);
+    res.status(500).json({ error: "Could not load ticket" });
+  }
+});
+
+app.post("/bookings/scan", requireCreator, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const payload = String((req.body && req.body.qrPayload) || "").trim();
+    const parts = payload.split("|");
+    if (parts.length !== 3 || parts[0] !== "VYBERA-TICKET") {
+      return res.status(400).json({ result: "invalid", error: "Invalid VYBERA ticket QR" });
+    }
+    await client.query("BEGIN");
+    const result = await client.query(
+      `SELECT b.* FROM bookings b
+       JOIN creator_events e ON e.id=b.event_id
+       WHERE b.id=$1 AND b.qr_token=$2 AND e.creator_id=$3
+       FOR UPDATE OF b`,
+      [parts[1], parts[2], req.creator.sub]
+    );
+    if (!result.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ result: "invalid", error: "Ticket not found" });
+    }
+    const booking = result.rows[0];
+    if (booking.status === "refunded") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ result: "invalid", error: "Ticket was refunded" });
+    }
+    if (booking.scanned_at) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ result: "duplicate", booking: await ticketResponse(booking) });
+    }
+    const updated = await client.query("UPDATE bookings SET scanned_at=NOW() WHERE id=$1 RETURNING *", [booking.id]);
+    await client.query("COMMIT");
+    res.json({ result: "valid", booking: await ticketResponse(updated.rows[0]) });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Ticket scan failed:", err);
+    res.status(500).json({ result: "invalid", error: "Could not validate ticket" });
+  } finally {
+    client.release();
   }
 });
 
