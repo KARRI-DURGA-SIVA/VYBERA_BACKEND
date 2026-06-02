@@ -221,6 +221,20 @@ const requireBuyer = (req, res, next) => {
   }
 };
 
+const requireProfileIdentity = (req, res, next) => {
+  try {
+    const auth = req.headers.authorization || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    const payload = verifyJwt(token);
+    const email = String(payload.email || "").trim().toLowerCase();
+    if (!email) throw new Error("Profile login required");
+    req.profileIdentity = { ...payload, email };
+    next();
+  } catch (err) {
+    res.status(401).json({ error: err.message || "Profile login required" });
+  }
+};
+
 const getSigningKey = (secret, dateStamp) => {
   const kDate = hmac(`AWS4${secret}`, dateStamp);
   const kRegion = hmac(kDate, "auto");
@@ -1627,7 +1641,34 @@ app.get("/bookings/mine", requireBuyer, async (req, res) => {
   }
 });
 
-app.get("/profile/creator-events", requireBuyer, async (req, res) => {
+app.get("/profile/tickets", requireProfileIdentity, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT b.*
+       FROM bookings b
+       LEFT JOIN users u ON u.id=b.user_id
+       WHERE LOWER(COALESCE(b.buyer_email, u.email, ''))=LOWER($1)
+       ORDER BY b.booked_at DESC`,
+      [req.profileIdentity.email]
+    );
+    const bookings = await Promise.all(result.rows.map(async (booking) => {
+      if (!booking.qr_token) {
+        const updated = await pool.query(
+          "UPDATE bookings SET qr_token=$1 WHERE id=$2 RETURNING *",
+          [crypto.randomBytes(24).toString("hex"), booking.id]
+        );
+        booking = updated.rows[0];
+      }
+      return ticketResponse(booking);
+    }));
+    res.json({ bookings });
+  } catch (err) {
+    console.error("Profile tickets failed:", err);
+    res.status(500).json({ error: "Could not load profile tickets" });
+  }
+});
+
+app.get("/profile/creator-events", requireProfileIdentity, async (req, res) => {
   try {
     const result = await pool.query(
       `${creatorEventSalesQuery}
@@ -1635,7 +1676,7 @@ app.get("/profile/creator-events", requireBuyer, async (req, res) => {
        WHERE LOWER(c.email)=LOWER($1)
        GROUP BY e.id
        ORDER BY e.created_at DESC`,
-      [req.buyer.email]
+      [req.profileIdentity.email]
     );
     res.json({ events: result.rows.map(publicCreatorEvent) });
   } catch (err) {
