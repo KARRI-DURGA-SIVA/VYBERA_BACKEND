@@ -21,6 +21,10 @@ app.use(express.static(path.join(__dirname)));
 app.use("/VYBERA", express.static(path.join(__dirname)));
 app.use("/uploads", express.static(uploadsDir));
 
+app.get(["/firebaseconfig.js", "/VYBERA/firebaseconfig.js"], (req, res) => {
+  res.type("text/javascript").sendFile(path.join(__dirname, "firebaseconfig.js"));
+});
+
 if (!process.env.DATABASE_URL) {
   console.error("DATABASE_URL is missing. Add it to VYBERA/.env before starting the server.");
   process.exit(1);
@@ -155,6 +159,44 @@ const publicStaffAssignment = (assignment) => ({
   assignedAt: assignment.created_at,
 });
 
+const publicStaffShareUrl = (req, member) => {
+  if (!member || !member.share_token) return "";
+  const origin = req ? `${req.protocol}://${req.get("host")}` : "";
+  const eventId = member.primary_event_id ? `&event=${encodeURIComponent(member.primary_event_id)}` : "";
+  return `${origin}/?staff=${encodeURIComponent(member.share_token)}${eventId}`;
+};
+
+const publicStaffSale = (sale) => ({
+  id: sale.id,
+  staffPk: sale.staff_id,
+  assignmentId: sale.assignment_id,
+  eventId: sale.event_id,
+  eventName: sale.event_name,
+  tierName: sale.tier_name,
+  buyerName: sale.buyer_name,
+  buyerPhone: sale.buyer_phone,
+  buyerEmail: sale.buyer_email,
+  qty: Number(sale.qty || 0),
+  price: Number(sale.price || 0),
+  total: Number(sale.total || 0),
+  paymentMode: sale.payment_mode,
+  bookingId: sale.booking_id,
+  soldAt: sale.created_at,
+});
+
+const publicStaffWithdrawal = (withdrawal) => ({
+  id: withdrawal.id,
+  staffPk: withdrawal.staff_id,
+  amount: Number(withdrawal.amount || 0),
+  method: withdrawal.method,
+  bankAccountName: withdrawal.bank_account_name,
+  bankAccountNumber: withdrawal.bank_account_number,
+  bankIfsc: withdrawal.bank_ifsc,
+  upiId: withdrawal.upi_id,
+  status: withdrawal.status,
+  requestedAt: withdrawal.created_at,
+});
+
 const publicStaff = (member) => ({
   id: member.id,
   creatorId: member.creator_id,
@@ -165,6 +207,9 @@ const publicStaff = (member) => ({
   role: member.role,
   assignedGate: member.assigned_gate,
   gates: member.assigned_gate ? [member.assigned_gate] : [],
+  primaryEventId: member.primary_event_id,
+  shareToken: member.share_token,
+  shareUrl: member.share_url || "",
   status: member.status,
   assignedTickets: Number(member.assigned_tickets || 0),
   soldTickets: Number(member.sold_tickets || 0),
@@ -205,6 +250,19 @@ const requireAdmin = (req, res, next) => {
     next();
   } catch (err) {
     res.status(401).json({ error: err.message || "Admin login required" });
+  }
+};
+
+const requireStaff = (req, res, next) => {
+  try {
+    const auth = req.headers.authorization || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    const payload = verifyJwt(token);
+    if (payload.scope !== "staff") throw new Error("Staff login required");
+    req.staff = payload;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: err.message || "Staff login required" });
   }
 };
 
@@ -511,7 +569,9 @@ const initDb = async () => {
     ALTER TABLE staff_accounts
       ADD COLUMN IF NOT EXISTS password TEXT,
       ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'Scanner',
-      ADD COLUMN IF NOT EXISTS assigned_gate TEXT
+      ADD COLUMN IF NOT EXISTS assigned_gate TEXT,
+      ADD COLUMN IF NOT EXISTS primary_event_id TEXT,
+      ADD COLUMN IF NOT EXISTS share_token TEXT UNIQUE
   `);
 
   await pool.query(`
@@ -525,6 +585,43 @@ const initDb = async () => {
       qty INTEGER NOT NULL,
       sold_count INTEGER NOT NULL DEFAULT 0,
       price NUMERIC NOT NULL DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS staff_sales (
+      id TEXT PRIMARY KEY,
+      creator_id INTEGER NOT NULL REFERENCES creator_accounts(id) ON DELETE CASCADE,
+      staff_id TEXT NOT NULL REFERENCES staff_accounts(id) ON DELETE CASCADE,
+      assignment_id TEXT REFERENCES staff_assignments(id) ON DELETE SET NULL,
+      event_id TEXT NOT NULL REFERENCES creator_events(id) ON DELETE CASCADE,
+      event_name TEXT NOT NULL,
+      tier_name TEXT NOT NULL,
+      buyer_name TEXT,
+      buyer_phone TEXT,
+      buyer_email TEXT,
+      qty INTEGER NOT NULL DEFAULT 1,
+      price NUMERIC NOT NULL DEFAULT 0,
+      total NUMERIC NOT NULL DEFAULT 0,
+      payment_mode TEXT NOT NULL DEFAULT 'cash',
+      booking_id TEXT REFERENCES bookings(id) ON DELETE SET NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS staff_withdrawals (
+      id TEXT PRIMARY KEY,
+      creator_id INTEGER NOT NULL REFERENCES creator_accounts(id) ON DELETE CASCADE,
+      staff_id TEXT NOT NULL REFERENCES staff_accounts(id) ON DELETE CASCADE,
+      amount NUMERIC NOT NULL,
+      method TEXT NOT NULL DEFAULT 'upi',
+      bank_account_name TEXT,
+      bank_account_number TEXT,
+      bank_ifsc TEXT,
+      upi_id TEXT,
+      status TEXT NOT NULL DEFAULT 'Pending',
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
@@ -608,6 +705,20 @@ app.get("/health", async (req, res) => {
     res.json({ ok: true, database: "connected", r2: hasR2Config() ? "configured" : "missing" });
   } catch (err) {
     res.status(500).json({ ok: false, database: "error", error: err.message });
+  }
+});
+
+app.get("/qr", async (req, res) => {
+  try {
+    const text = String((req.query && req.query.text) || "").trim();
+    if (!text) return res.status(400).send("Missing QR text");
+    const png = await QRCode.toBuffer(text, { width: 420, margin: 2, errorCorrectionLevel: "M" });
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "public, max-age=300");
+    res.send(png);
+  } catch (err) {
+    console.error("QR generation failed:", err);
+    res.status(500).send("Could not generate QR");
   }
 });
 
@@ -928,13 +1039,44 @@ app.post("/creator/events", requireCreator, async (req, res) => {
 
 app.get("/creator/staff", requireCreator, async (req, res) => {
   try {
-    const [staff, assignments] = await Promise.all([
-      pool.query("SELECT * FROM staff_accounts WHERE creator_id=$1 ORDER BY created_at DESC", [req.creator.sub]),
+    const [staff, assignments, salesSummary] = await Promise.all([
+      pool.query(
+        `SELECT s.*,
+           COALESCE(SUM(ss.qty),0)::INTEGER AS db_sold_tickets,
+           COALESCE(SUM(ss.total),0)::NUMERIC AS db_earnings
+         FROM staff_accounts s
+         LEFT JOIN staff_sales ss ON ss.staff_id=s.id
+         WHERE s.creator_id=$1
+         GROUP BY s.id
+         ORDER BY s.created_at DESC`,
+        [req.creator.sub]
+      ),
       pool.query("SELECT * FROM staff_assignments WHERE creator_id=$1 ORDER BY created_at DESC", [req.creator.sub]),
+      pool.query(
+        `SELECT
+           COALESCE(SUM(qty),0)::INTEGER AS tickets_sold,
+           COALESCE(SUM(total),0)::NUMERIC AS revenue
+         FROM staff_sales
+         WHERE creator_id=$1`,
+        [req.creator.sub]
+      ),
     ]);
+    const summary = salesSummary.rows[0] || {};
     res.json({
-      staff: staff.rows.map(publicStaff),
+      staff: staff.rows.map((member) => {
+        const mapped = {
+          ...member,
+          sold_tickets: Number(member.db_sold_tickets || member.sold_tickets || 0),
+          earnings: Number(member.db_earnings || member.earnings || 0),
+        };
+        return publicStaff({ ...mapped, share_url: publicStaffShareUrl(req, mapped) });
+      }),
       assignments: assignments.rows.map(publicStaffAssignment),
+      summary: {
+        totalStaff: staff.rows.length,
+        ticketsSold: Number(summary.tickets_sold || 0),
+        revenue: Number(summary.revenue || 0),
+      },
     });
   } catch (err) {
     console.error("Creator staff list failed:", err);
@@ -1020,15 +1162,18 @@ app.post("/creator/staff", requireCreator, async (req, res) => {
     }
     await client.query("BEGIN");
     const id = `STF-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
+    const shareToken = `${cleanPathSegment(cleanStaffId, "staff")}-${crypto.randomBytes(4).toString("hex")}`;
     const result = await client.query(
-      `INSERT INTO staff_accounts (id, creator_id, name, staff_id, email, phone, password, role, assigned_gate)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      `INSERT INTO staff_accounts (id, creator_id, name, staff_id, email, phone, password, role, assigned_gate, primary_event_id, share_token)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        RETURNING *`,
       [
         id, req.creator.sub, String(name).trim(), cleanStaffId,
         String(email || "").trim() || null, String(phone || "").trim() || null,
         await bcrypt.hash(cleanPassword, 10), String(role || "Scanner").trim(),
         String(assignedGate || "").trim() || null,
+        eventId ? String(eventId) : null,
+        shareToken,
       ]
     );
     let assignment = null;
@@ -1044,7 +1189,7 @@ app.post("/creator/staff", requireCreator, async (req, res) => {
     await client.query("COMMIT");
     res.status(201).json({
       message: "Staff member added successfully",
-      staff: publicStaff(result.rows[0]),
+      staff: publicStaff({ ...result.rows[0], share_url: publicStaffShareUrl(req, result.rows[0]) }),
       assignment: assignment ? publicStaffAssignment(assignment) : null,
     });
   } catch (err) {
@@ -1070,7 +1215,10 @@ const createStaffAssignment = async (client, { creatorId, staffId, eventId, tier
   if (Number(tier.qty || 0) < cleanQty) throw new Error("Not enough tickets available");
   tier.qty = Number(tier.qty || 0) - cleanQty;
   await client.query("UPDATE creator_events SET tickets=$1 WHERE id=$2", [JSON.stringify(tickets), eventId]);
-  await client.query("UPDATE staff_accounts SET assigned_tickets=assigned_tickets+$1 WHERE id=$2", [cleanQty, staffId]);
+  await client.query(
+    "UPDATE staff_accounts SET assigned_tickets=assigned_tickets+$1, primary_event_id=COALESCE(primary_event_id,$3) WHERE id=$2",
+    [cleanQty, staffId, eventId]
+  );
   const id = `ASN-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
   const result = await client.query(
     `INSERT INTO staff_assignments (id, creator_id, staff_id, event_id, event_name, tier_name, qty, price)
@@ -1079,6 +1227,43 @@ const createStaffAssignment = async (client, { creatorId, staffId, eventId, tier
     [id, creatorId, staffId, eventId, event.rows[0].name, tierName, cleanQty, Number(tier.price || 0)]
   );
   return result.rows[0];
+};
+
+const eventSalesClosed = (event) => {
+  const value = String(event && event.event_date || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const eventDate = new Date(`${value}T23:59:59.999Z`);
+  return Number.isFinite(eventDate.getTime()) && eventDate < new Date();
+};
+
+const staffWalletFor = async (staffId) => {
+  const result = await pool.query(
+    `SELECT
+       COALESCE(SUM(CASE WHEN payment_mode='online' THEN total ELSE 0 END),0)::NUMERIC AS online_revenue,
+       COALESCE(SUM(CASE WHEN payment_mode='cash' THEN total ELSE 0 END),0)::NUMERIC AS cash_revenue,
+       COALESCE(SUM(total),0)::NUMERIC AS total_earned,
+       COALESCE(SUM(qty),0)::INTEGER AS tickets_sold
+     FROM staff_sales
+     WHERE staff_id=$1`,
+    [staffId]
+  );
+  const withdrawals = await pool.query(
+    `SELECT COALESCE(SUM(amount),0)::NUMERIC AS withdrawn
+     FROM staff_withdrawals
+     WHERE staff_id=$1 AND status <> 'Rejected'`,
+    [staffId]
+  );
+  const row = result.rows[0] || {};
+  const withdrawn = Number((withdrawals.rows[0] && withdrawals.rows[0].withdrawn) || 0);
+  const totalEarned = Number(row.total_earned || 0);
+  return {
+    onlineRevenue: Number(row.online_revenue || 0),
+    cashRevenue: Number(row.cash_revenue || 0),
+    totalEarned,
+    withdrawn,
+    availableBalance: Math.max(0, totalEarned - withdrawn),
+    ticketsSold: Number(row.tickets_sold || 0),
+  };
 };
 
 app.post("/creator/staff/:staffId/assignments", requireCreator, async (req, res) => {
@@ -1100,6 +1285,309 @@ app.post("/creator/staff/:staffId/assignments", requireCreator, async (req, res)
     res.status(400).json({ error: err.message || "Could not assign tickets" });
   } finally {
     client.release();
+  }
+});
+
+app.post("/staff/login", async (req, res) => {
+  try {
+    const staffId = String((req.body && req.body.staffId) || "").trim();
+    const cleanStaffId = staffId.toLowerCase();
+    const digits = staffId.replace(/\D/g, "");
+    const password = String((req.body && req.body.password) || "");
+    if (!staffId || !password) {
+      return res.status(400).json({ error: "Staff login ID and password are required" });
+    }
+    const result = await pool.query(
+      `SELECT *
+       FROM staff_accounts
+       WHERE status='active'
+         AND (
+           LOWER(staff_id)=LOWER($1)
+           OR LOWER(COALESCE(email,''))=LOWER($1)
+           OR regexp_replace(COALESCE(phone,''), '[^0-9]', '', 'g')=$2
+         )
+       LIMIT 1`,
+      [cleanStaffId, digits]
+    );
+    if (!result.rows.length || !result.rows[0].password) {
+      return res.status(404).json({ error: "Staff account not found", staffNotFound: true });
+    }
+    const member = result.rows[0];
+    const ok = await bcrypt.compare(password, member.password);
+    if (!ok) return res.status(401).json({ error: "Invalid staff login ID or password" });
+    const [assignments, events, sales, withdrawals, wallet] = await Promise.all([
+      pool.query("SELECT * FROM staff_assignments WHERE staff_id=$1 ORDER BY created_at DESC", [member.id]),
+      pool.query(
+        `${creatorEventSalesQuery}
+         WHERE e.creator_id=$1
+         GROUP BY e.id
+         ORDER BY e.created_at DESC`,
+        [member.creator_id]
+      ),
+      pool.query("SELECT * FROM staff_sales WHERE staff_id=$1 ORDER BY created_at DESC", [member.id]),
+      pool.query("SELECT * FROM staff_withdrawals WHERE staff_id=$1 ORDER BY created_at DESC", [member.id]),
+      staffWalletFor(member.id),
+    ]);
+    res.json({
+      message: "Staff login successful",
+      staff: publicStaff({ ...member, share_url: publicStaffShareUrl(req, member) }),
+      assignments: assignments.rows.map(publicStaffAssignment),
+      events: events.rows.map(publicCreatorEvent),
+      sales: sales.rows.map(publicStaffSale),
+      withdrawals: withdrawals.rows.map(publicStaffWithdrawal),
+      wallet,
+      token: signJwt({ sub: member.id, staffId: member.staff_id, creatorId: member.creator_id, scope: "staff" }),
+    });
+  } catch (err) {
+    console.error("Staff login failed:", err);
+    res.status(500).json({ error: "Staff login failed" });
+  }
+});
+
+app.get("/staff/lookup", async (req, res) => {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    const identifier = String((req.query && req.query.identifier) || "").trim();
+    const digits = identifier.replace(/\D/g, "");
+    if (!identifier) return res.json({ exists: false });
+    const result = await pool.query(
+      `SELECT 1
+       FROM staff_accounts
+       WHERE status='active'
+         AND (
+           LOWER(staff_id)=LOWER($1)
+           OR LOWER(COALESCE(email,''))=LOWER($1)
+           OR regexp_replace(COALESCE(phone,''), '[^0-9]', '', 'g')=$2
+         )
+       LIMIT 1`,
+      [identifier.toLowerCase(), digits]
+    );
+    res.json({ exists: Boolean(result.rows.length) });
+  } catch (err) {
+    console.error("Staff lookup failed:", err);
+    res.status(500).json({ error: "Could not check staff account" });
+  }
+});
+
+app.get("/staff/share/:token", async (req, res) => {
+  try {
+    const token = String(req.params.token || "").trim();
+    const result = await pool.query(
+      `SELECT s.id, s.name, s.staff_id, s.share_token, s.primary_event_id, e.name AS event_name
+       FROM staff_accounts s
+       LEFT JOIN creator_events e ON e.id=s.primary_event_id
+       WHERE s.share_token=$1 AND s.status='active'
+       LIMIT 1`,
+      [token]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Staff share link not found" });
+    const row = result.rows[0];
+    res.json({
+      staff: {
+        id: row.id,
+        name: row.name,
+        staffId: row.staff_id,
+        shareToken: row.share_token,
+        primaryEventId: row.primary_event_id,
+        eventName: row.event_name,
+      },
+    });
+  } catch (err) {
+    console.error("Staff share lookup failed:", err);
+    res.status(500).json({ error: "Could not load staff share link" });
+  }
+});
+
+app.get("/staff/dashboard", requireStaff, async (req, res) => {
+  try {
+    const staff = await pool.query("SELECT * FROM staff_accounts WHERE id=$1 AND status='active'", [req.staff.sub]);
+    if (!staff.rows.length) return res.status(404).json({ error: "Staff account not found" });
+    const member = staff.rows[0];
+    const [assignments, events, sales, withdrawals, wallet] = await Promise.all([
+      pool.query("SELECT * FROM staff_assignments WHERE staff_id=$1 ORDER BY created_at DESC", [member.id]),
+      pool.query(
+        `${creatorEventSalesQuery}
+         WHERE e.creator_id=$1
+         GROUP BY e.id
+         ORDER BY e.created_at DESC`,
+        [member.creator_id]
+      ),
+      pool.query("SELECT * FROM staff_sales WHERE staff_id=$1 ORDER BY created_at DESC", [member.id]),
+      pool.query("SELECT * FROM staff_withdrawals WHERE staff_id=$1 ORDER BY created_at DESC", [member.id]),
+      staffWalletFor(member.id),
+    ]);
+    res.json({
+      staff: publicStaff({ ...member, share_url: publicStaffShareUrl(req, member) }),
+      assignments: assignments.rows.map(publicStaffAssignment),
+      events: events.rows.map(publicCreatorEvent),
+      sales: sales.rows.map(publicStaffSale),
+      withdrawals: withdrawals.rows.map(publicStaffWithdrawal),
+      wallet,
+    });
+  } catch (err) {
+    console.error("Staff dashboard failed:", err);
+    res.status(500).json({ error: "Could not load staff dashboard" });
+  }
+});
+
+app.post("/staff/sales", requireStaff, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { assignmentId, buyerName, buyerPhone, buyerEmail, qty, paymentMode } = req.body || {};
+    const cleanQty = Number(qty || 1);
+    if (!assignmentId) return res.status(400).json({ error: "Select assigned tickets to sell" });
+    if (!Number.isInteger(cleanQty) || cleanQty < 1) return res.status(400).json({ error: "Enter a valid ticket quantity" });
+    const mode = String(paymentMode || "cash").trim().toLowerCase() === "online" ? "online" : "cash";
+    await client.query("BEGIN");
+    const staff = await client.query("SELECT * FROM staff_accounts WHERE id=$1 AND status='active' FOR UPDATE", [req.staff.sub]);
+    if (!staff.rows.length) throw new Error("Staff account not found");
+    const assignment = await client.query(
+      `SELECT a.*, e.event_date, e.venue, e.banner_url, e.status AS event_status
+       FROM staff_assignments a
+       JOIN creator_events e ON e.id=a.event_id
+       WHERE a.id=$1 AND a.staff_id=$2
+       FOR UPDATE OF a`,
+      [assignmentId, req.staff.sub]
+    );
+    if (!assignment.rows.length) throw new Error("Assigned tickets not found");
+    const assigned = assignment.rows[0];
+    if (eventSalesClosed(assigned) || assigned.event_status !== "live") {
+      throw new Error("This event is completed or not live. Staff can view data only.");
+    }
+    const remaining = Number(assigned.qty || 0) - Number(assigned.sold_count || 0);
+    if (cleanQty > remaining) throw new Error(`Only ${remaining} tickets are available in this assignment`);
+    const id = `SLS-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
+    const bookingId = `STF-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
+    const total = Number(assigned.price || 0) * cleanQty;
+    const qrToken = crypto.randomBytes(18).toString("hex");
+    const savedBooking = await client.query(
+      `INSERT INTO bookings (
+        id, buyer_name, buyer_email, event_id, event_name, event_date, event_venue,
+        event_banner, ticket_type, price, qty, total, status, qr_token, booked_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'upcoming',$13,NOW())
+      RETURNING *`,
+      [
+        bookingId,
+        String(buyerName || "Walk-in Customer").trim(),
+        String(buyerEmail || "").trim() || null,
+        assigned.event_id,
+        assigned.event_name,
+        assigned.event_date,
+        assigned.venue,
+        assigned.banner_url,
+        assigned.tier_name,
+        Number(assigned.price || 0),
+        cleanQty,
+        total,
+        qrToken,
+      ]
+    );
+    const sale = await client.query(
+      `INSERT INTO staff_sales (
+        id, creator_id, staff_id, assignment_id, event_id, event_name, tier_name,
+        buyer_name, buyer_phone, buyer_email, qty, price, total, payment_mode, booking_id
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      RETURNING *`,
+      [
+        id,
+        staff.rows[0].creator_id,
+        staff.rows[0].id,
+        assigned.id,
+        assigned.event_id,
+        assigned.event_name,
+        assigned.tier_name,
+        String(buyerName || "Walk-in Customer").trim(),
+        String(buyerPhone || "").trim() || null,
+        String(buyerEmail || "").trim() || null,
+        cleanQty,
+        Number(assigned.price || 0),
+        total,
+        mode,
+        bookingId,
+      ]
+    );
+    await client.query("UPDATE staff_assignments SET sold_count=sold_count+$1 WHERE id=$2", [cleanQty, assigned.id]);
+    await client.query(
+      "UPDATE staff_accounts SET sold_tickets=sold_tickets+$1, earnings=earnings+$2 WHERE id=$3",
+      [cleanQty, total, staff.rows[0].id]
+    );
+    await client.query(
+      `UPDATE creator_events e SET
+         booking_count=COALESCE(s.tickets,0),
+         revenue=COALESCE(s.revenue,0)
+       FROM (
+         SELECT event_id,
+           COALESCE(SUM(CASE WHEN status <> 'refunded' THEN qty ELSE 0 END),0)::INTEGER AS tickets,
+           COALESCE(SUM(CASE WHEN status <> 'refunded' THEN total ELSE 0 END),0)::NUMERIC AS revenue
+         FROM bookings
+         WHERE event_id=$1
+         GROUP BY event_id
+       ) s
+       WHERE e.id=s.event_id`,
+      [assigned.event_id]
+    );
+    await client.query("COMMIT");
+    const wallet = await staffWalletFor(staff.rows[0].id);
+    res.status(201).json({
+      message: "Ticket sold successfully",
+      sale: publicStaffSale(sale.rows[0]),
+      booking: await ticketResponse(savedBooking.rows[0]),
+      wallet,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Staff sale failed:", err);
+    res.status(400).json({ error: err.message || "Could not sell ticket" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/staff/withdrawals", requireStaff, async (req, res) => {
+  try {
+    const amount = Number(req.body && req.body.amount);
+    const method = String((req.body && req.body.method) || "upi").trim().toLowerCase() === "bank" ? "bank" : "upi";
+    if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: "Enter a valid withdrawal amount" });
+    const staff = await pool.query("SELECT * FROM staff_accounts WHERE id=$1 AND status='active'", [req.staff.sub]);
+    if (!staff.rows.length) return res.status(404).json({ error: "Staff account not found" });
+    const wallet = await staffWalletFor(req.staff.sub);
+    if (amount > wallet.availableBalance) return res.status(400).json({ error: "Amount exceeds available balance" });
+    const bankAccountName = String((req.body && req.body.bankAccountName) || "").trim();
+    const bankAccountNumber = String((req.body && req.body.bankAccountNumber) || "").trim();
+    const bankIfsc = String((req.body && req.body.bankIfsc) || "").trim().toUpperCase();
+    const upiId = String((req.body && req.body.upiId) || "").trim();
+    if (method === "bank" && (!bankAccountName || !bankAccountNumber || !bankIfsc)) {
+      return res.status(400).json({ error: "Add bank account name, account number, and IFSC before withdrawal" });
+    }
+    if (method === "upi" && !upiId) {
+      return res.status(400).json({ error: "Add a UPI ID before withdrawal" });
+    }
+    const id = `WD-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
+    const result = await pool.query(
+      `INSERT INTO staff_withdrawals (
+        id, creator_id, staff_id, amount, method, bank_account_name, bank_account_number, bank_ifsc, upi_id
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      RETURNING *`,
+      [
+        id,
+        staff.rows[0].creator_id,
+        staff.rows[0].id,
+        amount,
+        method,
+        bankAccountName || null,
+        bankAccountNumber || null,
+        bankIfsc || null,
+        upiId || null,
+      ]
+    );
+    res.status(201).json({
+      message: "Withdrawal requested successfully",
+      withdrawal: publicStaffWithdrawal(result.rows[0]),
+      wallet: await staffWalletFor(req.staff.sub),
+    });
+  } catch (err) {
+    console.error("Staff withdrawal failed:", err);
+    res.status(400).json({ error: err.message || "Could not request withdrawal" });
   }
 });
 
