@@ -150,12 +150,18 @@ const creatorEventSalesQuery = `
 const publicStaffAssignment = (assignment) => ({
   id: assignment.id,
   staffPk: assignment.staff_id,
+  staffId: assignment.staff_id,
   eventId: assignment.event_id,
   eventName: assignment.event_name,
   tierName: assignment.tier_name,
   qty: Number(assignment.qty || 0),
   soldCount: Number(assignment.sold_count || 0),
   price: Number(assignment.price || 0),
+  mode: assignment.allocation_mode || "creator_quota",
+  allocationMode: assignment.allocation_mode || "creator_quota",
+  commissionRate: Number(assignment.commission_rate || 0),
+  purchasePrice: Number(assignment.purchase_price || assignment.price || 0),
+  resalePrice: Number(assignment.resale_price || assignment.price || 0),
   assignedAt: assignment.created_at,
 });
 
@@ -179,6 +185,9 @@ const publicStaffSale = (sale) => ({
   qty: Number(sale.qty || 0),
   price: Number(sale.price || 0),
   total: Number(sale.total || 0),
+  commission: Number(sale.commission || 0),
+  revenueOwner: sale.revenue_owner || "staff",
+  allocationMode: sale.allocation_mode || "creator_quota",
   paymentMode: sale.payment_mode,
   bookingId: sale.booking_id,
   soldAt: sale.created_at,
@@ -473,7 +482,9 @@ const initDb = async () => {
     ALTER TABLE bookings
       ADD COLUMN IF NOT EXISTS buyer_name TEXT,
       ADD COLUMN IF NOT EXISTS qr_token TEXT,
-      ADD COLUMN IF NOT EXISTS scanned_at TIMESTAMPTZ
+      ADD COLUMN IF NOT EXISTS scanned_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS staff_id TEXT,
+      ADD COLUMN IF NOT EXISTS staff_ref TEXT
   `);
 
   await pool.query(`
@@ -590,6 +601,14 @@ const initDb = async () => {
   `);
 
   await pool.query(`
+    ALTER TABLE staff_assignments
+      ADD COLUMN IF NOT EXISTS allocation_mode TEXT NOT NULL DEFAULT 'creator_quota',
+      ADD COLUMN IF NOT EXISTS commission_rate NUMERIC NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS purchase_price NUMERIC NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS resale_price NUMERIC NOT NULL DEFAULT 0
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS staff_sales (
       id TEXT PRIMARY KEY,
       creator_id INTEGER NOT NULL REFERENCES creator_accounts(id) ON DELETE CASCADE,
@@ -608,6 +627,13 @@ const initDb = async () => {
       booking_id TEXT REFERENCES bookings(id) ON DELETE SET NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
+  `);
+
+  await pool.query(`
+    ALTER TABLE staff_sales
+      ADD COLUMN IF NOT EXISTS commission NUMERIC NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS revenue_owner TEXT NOT NULL DEFAULT 'staff',
+      ADD COLUMN IF NOT EXISTS allocation_mode TEXT NOT NULL DEFAULT 'creator_quota'
   `);
 
   await pool.query(`
@@ -1043,7 +1069,7 @@ app.get("/creator/staff", requireCreator, async (req, res) => {
       pool.query(
         `SELECT s.*,
            COALESCE(SUM(ss.qty),0)::INTEGER AS db_sold_tickets,
-           COALESCE(SUM(ss.total),0)::NUMERIC AS db_earnings
+           COALESCE(SUM(CASE WHEN ss.revenue_owner='staff' THEN ss.total ELSE ss.commission END),0)::NUMERIC AS db_earnings
          FROM staff_accounts s
          LEFT JOIN staff_sales ss ON ss.staff_id=s.id
          WHERE s.creator_id=$1
@@ -1154,7 +1180,10 @@ app.get("/creator/analytics", requireCreator, async (req, res) => {
 app.post("/creator/staff", requireCreator, async (req, res) => {
   const client = await pool.connect();
   try {
-    const { name, phone, email, staffId, password, role, assignedGate, eventId, tierName, qty } = req.body || {};
+    const {
+      name, phone, email, staffId, password, role, assignedGate, eventId, tierName, qty,
+      allocationMode, mode, commissionRate, purchasePrice, resalePrice,
+    } = req.body || {};
     const cleanStaffId = String(staffId || "").trim().toLowerCase();
     const cleanPassword = String(password || "");
     if (!name || !cleanStaffId || cleanPassword.length < 6) {
@@ -1179,11 +1208,16 @@ app.post("/creator/staff", requireCreator, async (req, res) => {
     let assignment = null;
     if (eventId && tierName && Number(qty) > 0) {
       assignment = await createStaffAssignment(client, {
-        creatorId: req.creator.sub,
-        staffId: id,
-        eventId,
-        tierName,
-        qty: Number(qty),
+      creatorId: req.creator.sub,
+      staffId: id,
+      eventId,
+      tierName,
+      qty: Number(qty),
+      allocationMode,
+      mode,
+      commissionRate,
+      purchasePrice,
+      resalePrice,
       });
     }
     await client.query("COMMIT");
@@ -1202,9 +1236,16 @@ app.post("/creator/staff", requireCreator, async (req, res) => {
   }
 });
 
-const createStaffAssignment = async (client, { creatorId, staffId, eventId, tierName, qty }) => {
+const createStaffAssignment = async (client, {
+  creatorId, staffId, eventId, tierName, qty,
+  allocationMode, mode, commissionRate, purchasePrice, resalePrice,
+}) => {
   const cleanQty = Number(qty);
   if (!Number.isInteger(cleanQty) || cleanQty < 1) throw new Error("Enter a valid ticket quantity");
+  const cleanMode = String(allocationMode || mode || "creator_quota") === "staff_owned"
+    ? "staff_owned"
+    : "creator_quota";
+  const cleanCommissionRate = Math.max(0, Number(commissionRate || 0));
   const staff = await client.query("SELECT id FROM staff_accounts WHERE id=$1 AND creator_id=$2", [staffId, creatorId]);
   if (!staff.rows.length) throw new Error("Staff member not found");
   const event = await client.query("SELECT * FROM creator_events WHERE id=$1 AND creator_id=$2 FOR UPDATE", [eventId, creatorId]);
@@ -1213,6 +1254,13 @@ const createStaffAssignment = async (client, { creatorId, staffId, eventId, tier
   const tier = tickets.find((ticket) => ticket.name === tierName);
   if (!tier) throw new Error("Ticket tier not found");
   if (Number(tier.qty || 0) < cleanQty) throw new Error("Not enough tickets available");
+  const basePrice = Number(tier.price || 0);
+  const cleanPurchasePrice = Number.isFinite(Number(purchasePrice)) && Number(purchasePrice) >= 0
+    ? Number(purchasePrice)
+    : basePrice;
+  const cleanResalePrice = Number.isFinite(Number(resalePrice)) && Number(resalePrice) >= 0
+    ? Number(resalePrice)
+    : basePrice;
   tier.qty = Number(tier.qty || 0) - cleanQty;
   await client.query("UPDATE creator_events SET tickets=$1 WHERE id=$2", [JSON.stringify(tickets), eventId]);
   await client.query(
@@ -1221,11 +1269,23 @@ const createStaffAssignment = async (client, { creatorId, staffId, eventId, tier
   );
   const id = `ASN-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
   const result = await client.query(
-    `INSERT INTO staff_assignments (id, creator_id, staff_id, event_id, event_name, tier_name, qty, price)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+    `INSERT INTO staff_assignments (
+       id, creator_id, staff_id, event_id, event_name, tier_name, qty, price,
+       allocation_mode, commission_rate, purchase_price, resale_price
+     )
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
      RETURNING *`,
-    [id, creatorId, staffId, eventId, event.rows[0].name, tierName, cleanQty, Number(tier.price || 0)]
+    [
+      id, creatorId, staffId, eventId, event.rows[0].name, tierName, cleanQty, basePrice,
+      cleanMode, cleanCommissionRate, cleanPurchasePrice, cleanResalePrice,
+    ]
   );
+  if (cleanMode === "staff_owned") {
+    await client.query(
+      "UPDATE creator_events SET revenue=COALESCE(revenue,0)+$1 WHERE id=$2",
+      [cleanPurchasePrice * cleanQty, eventId]
+    );
+  }
   return result.rows[0];
 };
 
@@ -1239,9 +1299,13 @@ const eventSalesClosed = (event) => {
 const staffWalletFor = async (staffId) => {
   const result = await pool.query(
     `SELECT
-       COALESCE(SUM(CASE WHEN payment_mode='online' THEN total ELSE 0 END),0)::NUMERIC AS online_revenue,
-       COALESCE(SUM(CASE WHEN payment_mode='cash' THEN total ELSE 0 END),0)::NUMERIC AS cash_revenue,
-       COALESCE(SUM(total),0)::NUMERIC AS total_earned,
+       COALESCE(SUM(CASE WHEN payment_mode='online' THEN
+         CASE WHEN revenue_owner='staff' THEN total ELSE commission END
+       ELSE 0 END),0)::NUMERIC AS online_revenue,
+       COALESCE(SUM(CASE WHEN payment_mode='cash' THEN
+         CASE WHEN revenue_owner='staff' THEN total ELSE commission END
+       ELSE 0 END),0)::NUMERIC AS cash_revenue,
+       COALESCE(SUM(CASE WHEN revenue_owner='staff' THEN total ELSE commission END),0)::NUMERIC AS total_earned,
        COALESCE(SUM(qty),0)::INTEGER AS tickets_sold
      FROM staff_sales
      WHERE staff_id=$1`,
@@ -1276,6 +1340,11 @@ app.post("/creator/staff/:staffId/assignments", requireCreator, async (req, res)
       eventId: req.body && req.body.eventId,
       tierName: req.body && req.body.tierName,
       qty: Number(req.body && req.body.qty),
+      allocationMode: req.body && req.body.allocationMode,
+      mode: req.body && req.body.mode,
+      commissionRate: req.body && req.body.commissionRate,
+      purchasePrice: req.body && req.body.purchasePrice,
+      resalePrice: req.body && req.body.resalePrice,
     });
     await client.query("COMMIT");
     res.status(201).json({ message: "Tickets assigned successfully", assignment: publicStaffAssignment(assignment) });
@@ -1371,14 +1440,21 @@ app.get("/staff/lookup", async (req, res) => {
 
 app.get("/staff/share/:token", async (req, res) => {
   try {
-    const token = String(req.params.token || "").trim();
+    const token = decodeURIComponent(String(req.params.token || "")).trim().replace(/[.)\]\s]+$/g, "");
+    const digits = token.replace(/\D/g, "");
     const result = await pool.query(
-      `SELECT s.id, s.name, s.staff_id, s.share_token, s.primary_event_id, e.name AS event_name
+      `SELECT s.id, s.name, s.staff_id, s.email, s.phone, s.share_token, s.primary_event_id, e.name AS event_name
        FROM staff_accounts s
        LEFT JOIN creator_events e ON e.id=s.primary_event_id
-       WHERE s.share_token=$1 AND s.status='active'
+       WHERE s.status='active'
+         AND (
+           s.share_token=$1
+           OR LOWER(s.staff_id)=LOWER($1)
+           OR LOWER(COALESCE(s.email,''))=LOWER($1)
+           OR regexp_replace(COALESCE(s.phone,''), '\\D', '', 'g')=$2
+         )
        LIMIT 1`,
-      [token]
+      [token, digits]
     );
     if (!result.rows.length) return res.status(404).json({ error: "Staff share link not found" });
     const row = result.rows[0];
@@ -1458,7 +1534,17 @@ app.post("/staff/sales", requireStaff, async (req, res) => {
     if (cleanQty > remaining) throw new Error(`Only ${remaining} tickets are available in this assignment`);
     const id = `SLS-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
     const bookingId = `STF-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
-    const total = Number(assigned.price || 0) * cleanQty;
+    const assignmentMode = String(assigned.allocation_mode || "creator_quota") === "staff_owned"
+      ? "staff_owned"
+      : "creator_quota";
+    const salePrice = assignmentMode === "staff_owned"
+      ? Number(assigned.resale_price || assigned.price || 0)
+      : Number(assigned.price || 0);
+    const total = salePrice * cleanQty;
+    const commission = assignmentMode === "creator_quota"
+      ? Math.round(total * Number(assigned.commission_rate || 0) / 100)
+      : 0;
+    const revenueOwner = assignmentMode === "staff_owned" ? "staff" : "creator";
     const qrToken = crypto.randomBytes(18).toString("hex");
     const savedBooking = await client.query(
       `INSERT INTO bookings (
@@ -1476,7 +1562,7 @@ app.post("/staff/sales", requireStaff, async (req, res) => {
         assigned.venue,
         assigned.banner_url,
         assigned.tier_name,
-        Number(assigned.price || 0),
+        salePrice,
         cleanQty,
         total,
         qrToken,
@@ -1485,8 +1571,9 @@ app.post("/staff/sales", requireStaff, async (req, res) => {
     const sale = await client.query(
       `INSERT INTO staff_sales (
         id, creator_id, staff_id, assignment_id, event_id, event_name, tier_name,
-        buyer_name, buyer_phone, buyer_email, qty, price, total, payment_mode, booking_id
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        buyer_name, buyer_phone, buyer_email, qty, price, total, payment_mode, booking_id,
+        commission, revenue_owner, allocation_mode
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
       RETURNING *`,
       [
         id,
@@ -1500,16 +1587,19 @@ app.post("/staff/sales", requireStaff, async (req, res) => {
         String(buyerPhone || "").trim() || null,
         String(buyerEmail || "").trim() || null,
         cleanQty,
-        Number(assigned.price || 0),
+        salePrice,
         total,
         mode,
         bookingId,
+        commission,
+        revenueOwner,
+        assignmentMode,
       ]
     );
     await client.query("UPDATE staff_assignments SET sold_count=sold_count+$1 WHERE id=$2", [cleanQty, assigned.id]);
     await client.query(
       "UPDATE staff_accounts SET sold_tickets=sold_tickets+$1, earnings=earnings+$2 WHERE id=$3",
-      [cleanQty, total, staff.rows[0].id]
+      [cleanQty, revenueOwner === "staff" ? total : commission, staff.rows[0].id]
     );
     await client.query(
       `UPDATE creator_events e SET
@@ -2038,18 +2128,43 @@ app.post("/bookings", async (req, res) => {
       userId = user.rows[0] ? user.rows[0].id : null;
     }
     const qrToken = crypto.randomBytes(18).toString("hex");
+    let staffMember = null;
+    const staffRef = String(
+      booking.staffId ||
+      booking.staffPk ||
+      booking.staffRef ||
+      (booking.staffReferral && (booking.staffReferral.staffDbId || booking.staffReferral.staffId || booking.staffReferral.token)) ||
+      ""
+    ).trim();
+    if (staffRef) {
+      const digits = staffRef.replace(/\D/g, "");
+      const staffResult = await client.query(
+        `SELECT * FROM staff_accounts
+         WHERE status='active'
+           AND (
+             id=$1 OR share_token=$1 OR LOWER(staff_id)=LOWER($1)
+             OR LOWER(COALESCE(email,''))=LOWER($1)
+             OR regexp_replace(COALESCE(phone,''), '\\D', '', 'g')=$2
+           )
+         LIMIT 1`,
+        [staffRef, digits]
+      );
+      staffMember = staffResult.rows[0] || null;
+    }
     const savedBooking = await client.query(
       `INSERT INTO bookings (
         id, user_id, buyer_name, buyer_email, event_id, event_name, event_date, event_venue,
         event_banner, ticket_type, price, qty, total, status,
-        ticket_record_url, ticket_record_key, ticket_record_storage, qr_token, booked_at
+        ticket_record_url, ticket_record_key, ticket_record_storage, qr_token, staff_id, staff_ref, booked_at
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
       ON CONFLICT (id) DO UPDATE SET
         ticket_record_url=EXCLUDED.ticket_record_url,
         ticket_record_key=EXCLUDED.ticket_record_key,
         ticket_record_storage=EXCLUDED.ticket_record_storage,
         buyer_name=COALESCE(bookings.buyer_name, EXCLUDED.buyer_name),
+        staff_id=COALESCE(bookings.staff_id, EXCLUDED.staff_id),
+        staff_ref=COALESCE(bookings.staff_ref, EXCLUDED.staff_ref),
         qr_token=COALESCE(bookings.qr_token, EXCLUDED.qr_token)
       RETURNING *`,
       [
@@ -2071,9 +2186,82 @@ app.post("/bookings", async (req, res) => {
         ticketRecord.key,
         ticketRecord.storage,
         qrToken,
+        staffMember ? staffMember.id : null,
+        staffRef || null,
         booking.bookedAt ? new Date(booking.bookedAt) : new Date(),
       ]
     );
+    if (staffMember && booking.eventId && booking.ticketType) {
+      const assignmentResult = await client.query(
+        `SELECT * FROM staff_assignments
+         WHERE staff_id=$1 AND event_id=$2 AND tier_name=$3
+         ORDER BY created_at DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [staffMember.id, booking.eventId, booking.ticketType]
+      );
+      const assignment = assignmentResult.rows[0] || null;
+      const cleanQty = Number(booking.qty || 1);
+      if (cleanQty > 0) {
+        const existingStaffSale = await client.query(
+          "SELECT id FROM staff_sales WHERE booking_id=$1 AND staff_id=$2 LIMIT 1",
+          [booking.id, staffMember.id]
+        );
+        if (!existingStaffSale.rows.length) {
+          let assignmentMode = "creator_quota";
+          let salePrice = Number(booking.price || 0);
+          let staffSaleTotal = salePrice * cleanQty;
+          let commission = 0;
+          let revenueOwner = "creator";
+          let assignmentId = null;
+          let saleEventName = booking.eventName || null;
+          let canRecordSale = true;
+          if (assignment) {
+            assignmentMode = String(assignment.allocation_mode || "creator_quota") === "staff_owned" ? "staff_owned" : "creator_quota";
+            salePrice = assignmentMode === "staff_owned"
+              ? Number(assignment.resale_price || assignment.price || booking.price || 0)
+              : Number(assignment.price || booking.price || 0);
+            staffSaleTotal = salePrice * cleanQty;
+            commission = assignmentMode === "creator_quota"
+              ? Math.round(staffSaleTotal * Number(assignment.commission_rate || 0) / 100)
+              : 0;
+            revenueOwner = assignmentMode === "staff_owned" ? "staff" : "creator";
+            assignmentId = assignment.id;
+            saleEventName = booking.eventName || assignment.event_name;
+            const remaining = Number(assignment.qty || 0) - Number(assignment.sold_count || 0);
+            canRecordSale = remaining >= cleanQty;
+          } else if (!salePrice && booking.total) {
+            salePrice = Number(booking.total || 0) / cleanQty;
+            staffSaleTotal = Number(booking.total || 0);
+          }
+          if (canRecordSale) {
+          const saleId = `SLS-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
+          await client.query(
+            `INSERT INTO staff_sales (
+              id, creator_id, staff_id, assignment_id, event_id, event_name, tier_name,
+              buyer_name, buyer_phone, buyer_email, qty, price, total, payment_mode, booking_id,
+              commission, revenue_owner, allocation_mode
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+            ON CONFLICT (id) DO NOTHING`,
+            [
+              saleId, staffMember.creator_id, staffMember.id, assignmentId, booking.eventId,
+              saleEventName, booking.ticketType,
+              booking.buyer || booking.buyerName || "Buyer", booking.buyerPhone || null, booking.buyerEmail || null,
+              cleanQty, salePrice, staffSaleTotal, (booking.payment && booking.payment.gateway) ? "online" : "cash",
+              booking.id, commission, revenueOwner, assignmentMode,
+            ]
+          );
+          if (assignmentId) {
+            await client.query("UPDATE staff_assignments SET sold_count=sold_count+$1 WHERE id=$2", [cleanQty, assignmentId]);
+          }
+          await client.query(
+            "UPDATE staff_accounts SET sold_tickets=sold_tickets+$1, earnings=earnings+$2 WHERE id=$3",
+            [cleanQty, revenueOwner === "staff" ? staffSaleTotal : commission, staffMember.id]
+          );
+          }
+        }
+      }
+    }
     if (booking.eventId) {
       await client.query(
         `UPDATE creator_events e SET
