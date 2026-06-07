@@ -14,7 +14,23 @@ const appHtmlPath = path.join(__dirname, "..", "vybera_26.html");
 const uploadsDir = path.join(__dirname, "uploads");
 fs.mkdirSync(uploadsDir, { recursive: true });
 
-app.use(cors());
+const corsOptions = {
+  origin: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "ngrok-skip-browser-warning", "X-Requested-With"],
+  exposedHeaders: ["Content-Length", "Content-Type"],
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", req.headers.origin || "*");
+  res.header("Vary", "Origin");
+  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, ngrok-skip-browser-warning, X-Requested-With");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 app.use(bodyParser.json({ limit: "30mb" }));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname)));
@@ -716,12 +732,17 @@ initDb().catch((err) => {
 
 // OPEN HTML PAGE
 app.get("/", (req, res) => {
-
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
   res.sendFile(appHtmlPath);
 
 });
 
 app.get("/vybera_26.html", (req, res) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
   res.sendFile(appHtmlPath);
 });
 
@@ -1986,7 +2007,7 @@ const payuReturnHtml = (result) => `<!doctype html>
 <div>Completing payment...</div>
 <script>
 localStorage.setItem('VYBERA_PAYU_RESULT', ${JSON.stringify(JSON.stringify(result))});
-window.location.href = '/';
+window.location.replace('/?payment=payu');
 </script>
 </body></html>`;
 

@@ -4,7 +4,6 @@ import {
   GoogleAuthProvider,
   browserLocalPersistence,
   setPersistence,
-  onAuthStateChanged,
   signInWithPopup,
   signInWithRedirect,
   getRedirectResult,
@@ -53,6 +52,10 @@ function clearGooglePending() {
   try { window.sessionStorage.removeItem("VYBERA_GOOGLE_PENDING"); } catch (_) {}
 }
 
+function hasGooglePending() {
+  try { return window.sessionStorage.getItem("VYBERA_GOOGLE_PENDING") === "1"; } catch (_) { return false; }
+}
+
 function forceBuyerHome() {
   if (typeof window.showPage === "function") {
     const homeNav = document.querySelector(".buyer-nav .nav-btn");
@@ -64,6 +67,7 @@ function forceBuyerHome() {
 
 async function finishGoogleUser(user) {
   if (!user || googleSessionApplied) return;
+  if (!hasGooglePending()) return;
   const displayName = user.displayName || "Google User";
   const email = user.email || "";
   if (!email) {
@@ -92,13 +96,6 @@ getRedirectResult(auth)
   .catch((err) => {
     console.error("Google redirect result failed:", err);
   });
-
-onAuthStateChanged(auth, (user) => {
-  if (!user || googleSessionApplied) return;
-  finishGoogleUser(user).catch((err) => {
-    console.error("Google auth state sync failed:", err);
-  });
-});
 
 window.vyberaFirebaseGoogleSignIn = async function vyberaFirebaseGoogleSignIn() {
   try {
@@ -129,11 +126,8 @@ window.vyberaFirebaseGoogleSignIn = async function vyberaFirebaseGoogleSignIn() 
       return;
     }
 
-    if (typeof window.localGoogleSignInFallback === "function") {
-      return window.localGoogleSignInFallback();
-    }
-
     alert(err.message || "Google sign-in failed. Please try again.");
+    clearGooglePending();
   }
 };
 
