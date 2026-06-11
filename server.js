@@ -7,6 +7,7 @@ const cors = require("cors");
 const bcrypt = require("bcrypt");
 const crypto = require("crypto");
 const QRCode = require("qrcode");
+const twilio = require("twilio");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const app = express();
@@ -33,9 +34,7 @@ app.use((req, res, next) => {
 });
 app.use(bodyParser.json({ limit: "30mb" }));
 app.use(bodyParser.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname)));
-app.use("/VYBERA", express.static(path.join(__dirname)));
-app.use("/uploads", express.static(uploadsDir));
+// Static middleware will be added at the end, AFTER all API routes
 
 app.get(["/firebaseconfig.js", "/VYBERA/firebaseconfig.js"], (req, res) => {
   res.type("text/javascript").sendFile(path.join(__dirname, "firebaseconfig.js"));
@@ -77,6 +76,18 @@ if (!jwtSecret) {
   console.error("JWT_SECRET is missing. Add it to VYBERA/.env before starting the server.");
   process.exit(1);
 }
+
+// Twilio configuration
+const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID;
+const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
+const twilioPhoneNumber = process.env.TWILIO_PHONE_NUMBER;
+if (twilioAccountSid && twilioAuthToken && twilioPhoneNumber) {
+  console.log("Twilio configured successfully");
+} else {
+  console.warn("Twilio configuration incomplete: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_PHONE_NUMBER are required for OTP functionality");
+}
+const twilioClient = twilioAccountSid && twilioAuthToken ? twilio(twilioAccountSid, twilioAuthToken) : null;
+
 const base64Url = (value) =>
   Buffer.from(value).toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
 const base64UrlJson = (value) => base64Url(JSON.stringify(value));
@@ -1164,7 +1175,7 @@ app.get("/creator/analytics", requireCreator, async (req, res) => {
     ]);
     const gross = Number(summary.rows[0].gross || 0);
     const tickets = Number(summary.rows[0].tickets || 0);
-    const fee = Math.round(gross * 0.06);
+    const fee = Math.round(gross * 0.08);
     const net = gross - fee;
     res.json({
       summary: {
@@ -1814,7 +1825,7 @@ app.get("/admin/snapshot", requireAdmin, async (req, res) => {
         status: creator.kyc_status,
         events: Number(creator.events || 0),
         revenue: Number(creator.revenue || 0),
-        fee: 6,
+        fee: 8,
         createdAt: creator.created_at,
       })),
       events: events.rows.map(publicCreatorEvent),
@@ -2007,7 +2018,7 @@ const payuReturnHtml = (result) => `<!doctype html>
 <div>Completing payment...</div>
 <script>
 localStorage.setItem('VYBERA_PAYU_RESULT', ${JSON.stringify(JSON.stringify(result))});
-window.location.replace('/?payment=payu');
+window.location.replace('/?payment=payu&booking=' + encodeURIComponent(${JSON.stringify(result.bookingId || "")}));
 </script>
 </body></html>`;
 
@@ -2056,8 +2067,8 @@ app.post("/payments/payu/initiate", async (req, res) => {
       firstname: cleanPayuText(req.body.firstname || "VYBERA Guest", 60) || "VYBERA Guest",
       email: String(req.body.email || "guest@vybera.in").slice(0, 100),
       phone: String(req.body.phone || "9999999999").replace(/\D/g, "").slice(-10) || "9999999999",
-      surl: `${origin}/payments/payu/success`,
-      furl: `${origin}/payments/payu/failure`,
+      surl: `${origin}/payments/payu/success?booking=${encodeURIComponent(txnid)}`,
+      furl: `${origin}/payments/payu/failure?booking=${encodeURIComponent(txnid)}`,
       udf1: cleanPayuText(req.body.bookingId || "", 64),
       udf2: cleanPayuText(req.body.eventId || "", 64),
       udf3: cleanPayuText(req.body.ticketType || "", 64),
@@ -2442,135 +2453,233 @@ app.post("/bookings/scan", requireCreator, async (req, res) => {
 });
 
 
-const verifyMsg91AccessToken = async (accessToken) => {
-  if (!process.env.MSG91_AUTHKEY) {
-    throw new Error("MSG91_AUTHKEY is not configured");
-  }
-  const response = await fetch("https://control.msg91.com/api/v5/widget/verifyAccessToken", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      authkey: process.env.MSG91_AUTHKEY,
-      "access-token": accessToken,
-    }),
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const msg = data.message || data.error || data.error_message || "MSG91 token verification failed";
-    const err = new Error(msg);
-    err.status = response.status;
-    throw err;
-  }
-  if (String(data.type || "").toLowerCase() === "error" || data.error || data.error_message) {
-    const err = new Error(data.message || data.error || data.error_message || "MSG91 token verification failed");
-    err.status = 400;
-    throw err;
-  }
-  return data;
-};
+// TWILIO OTP ENDPOINTS
+const makeTwilioOtpToken = (identifier) =>
+  signJwt({ scope: "twilio-phone-otp", identifier }, 10 * 60);
 
-const msg91ErrorMessage = (data, fallback) => {
-  if (!data || typeof data !== "object") return fallback;
-  return data.message || data.error || data.error_message || data.description || fallback;
-};
-const assertMsg91Success = (response, data, fallback) => {
-  if (!response.ok || String(data.type || "").toLowerCase() === "error" || data.error || data.error_message) {
-    const err = new Error(msg91ErrorMessage(data, fallback));
-    err.status = response.ok ? 400 : response.status;
-    throw err;
-  }
-};
-
-const makeSignupOtpToken = (identifier) =>
-  signJwt({ scope: "signup-phone-otp", identifier }, 10 * 60);
-
-const verifySignupOtpToken = async (token, countryCode, phone) => {
-  const identifier = `${String(countryCode || "+91").replace(/\D/g, "")}${String(phone || "").replace(/\D/g, "")}`;
+const verifyTwilioOtpToken = async (token, countryCode, phone) => {
+  const identifier = `${String(countryCode || "+1").replace(/\D/g, "")}${String(phone || "").replace(/\D/g, "")}`;
   try {
     const payload = verifyJwt(token);
-    if (payload.scope !== "signup-phone-otp" || payload.identifier !== identifier) {
+    if (payload.scope !== "twilio-phone-otp" || payload.identifier !== identifier) {
       throw new Error("OTP verification does not match this phone number");
     }
     return payload;
   } catch (err) {
-    if (String(token || "").split(".").length === 3 && err.message !== "Invalid token signature") {
-      throw err;
-    }
-    await verifyMsg91AccessToken(token);
-    return { scope: "msg91-widget-otp", identifier };
+    throw err;
   }
 };
 
-app.post("/otp/msg91/send", async (req, res) => {
+app.post("/otp/send", async (req, res) => {
   try {
-    if (!process.env.MSG91_AUTHKEY) {
-      return res.status(500).json({ error: "MSG91_AUTHKEY must be configured" });
+    if (!twilioClient) {
+      return res.status(500).json({ error: "Twilio is not configured. Please add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_PHONE_NUMBER to .env" });
     }
-    if (!process.env.MSG91_OTP_TEMPLATE_ID) {
-      return res.status(500).json({ error: "MSG91_OTP_TEMPLATE_ID is required for captcha-free OTP sending" });
+    const phoneNumber = String((req.body && req.body.phoneNumber) || "").trim();
+    const countryCode = String((req.body && req.body.countryCode) || "+91").trim();
+
+    if (!phoneNumber || !/^\d{7,15}$/.test(phoneNumber.replace(/\D/g, ""))) {
+      return res.status(400).json({ error: "A valid phone number is required" });
     }
-    const identifier = String((req.body && req.body.identifier) || "").replace(/\D/g, "");
-    if (!/^91\d{10}$/.test(identifier)) {
-      return res.status(400).json({ error: "A valid India mobile number with country code is required" });
+
+    const fullPhoneNumber = `+${String(countryCode).replace(/\D/g, "")}${phoneNumber.replace(/\D/g, "")}`;
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+    try {
+      await twilioClient.messages.create({
+        body: `Your Vybera OTP is: ${otp}. This code will expire in 10 minutes.`,
+        from: twilioPhoneNumber,
+        to: fullPhoneNumber,
+      });
+
+      // Store OTP in memory (in production, use a database or cache like Redis)
+      if (!global.twilioOtps) global.twilioOtps = {};
+      const identifier = `${String(countryCode).replace(/\D/g, "")}${phoneNumber.replace(/\D/g, "")}`;
+      global.twilioOtps[identifier] = {
+        otp,
+        expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
+      };
+
+      res.json({
+        sent: true,
+        phoneNumber: fullPhoneNumber,
+        message: "OTP sent successfully"
+      });
+    } catch (twilioErr) {
+      console.error("Twilio send failed:", twilioErr);
+      res.status(500).json({
+        sent: false,
+        error: twilioErr.message || "Failed to send OTP via Twilio"
+      });
     }
-    const url = new URL("https://control.msg91.com/api/v5/otp");
-    url.searchParams.set("template_id", process.env.MSG91_OTP_TEMPLATE_ID);
-    url.searchParams.set("mobile", identifier);
-    url.searchParams.set("authkey", process.env.MSG91_AUTHKEY);
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
-    });
-    const data = await response.json().catch(() => ({}));
-    assertMsg91Success(response, data, "MSG91 OTP send failed");
-    res.json({ sent: true, identifier, data });
   } catch (err) {
-    console.error("MSG91 OTP send failed:", err);
-    res.status(err.status || 500).json({ sent: false, error: err.message || "MSG91 OTP send failed" });
+    console.error("Twilio OTP send error:", err);
+    res.status(500).json({ sent: false, error: err.message || "Twilio OTP send failed" });
   }
 });
 
-app.post("/otp/msg91/verify", async (req, res) => {
+app.post("/otp/verify", async (req, res) => {
   try {
-    if (!process.env.MSG91_AUTHKEY) {
-      return res.status(500).json({ error: "MSG91_AUTHKEY is not configured" });
+    if (!twilioClient) {
+      return res.status(500).json({ verified: false, error: "Twilio is not configured" });
     }
-    const identifier = String((req.body && req.body.identifier) || "").replace(/\D/g, "");
+
+    const phoneNumber = String((req.body && req.body.phoneNumber) || "").trim();
+    const countryCode = String((req.body && req.body.countryCode) || "+91").trim();
     const otp = String((req.body && req.body.otp) || "").trim();
-    if (!/^91\d{10}$/.test(identifier) || !/^\d{4,8}$/.test(otp)) {
-      return res.status(400).json({ verified: false, error: "A valid mobile number and OTP are required" });
+
+    if (!phoneNumber || !/^\d{7,15}$/.test(phoneNumber.replace(/\D/g, ""))) {
+      return res.status(400).json({ verified: false, error: "A valid phone number is required" });
     }
-    const url = new URL("https://control.msg91.com/api/v5/otp/verify");
-    url.searchParams.set("otp", otp);
-    url.searchParams.set("mobile", identifier);
-    const response = await fetch(url, {
-      method: "GET",
-      headers: { authkey: process.env.MSG91_AUTHKEY },
+
+    if (!/^\d{6}$/.test(otp)) {
+      return res.status(400).json({ verified: false, error: "OTP must be 6 digits" });
+    }
+
+    const identifier = `${String(countryCode).replace(/\D/g, "")}${phoneNumber.replace(/\D/g, "")}`;
+
+    if (!global.twilioOtps || !global.twilioOtps[identifier]) {
+      return res.status(400).json({ verified: false, error: "OTP not found. Please request a new OTP" });
+    }
+
+    const stored = global.twilioOtps[identifier];
+
+    if (Date.now() > stored.expiresAt) {
+      delete global.twilioOtps[identifier];
+      return res.status(400).json({ verified: false, error: "OTP has expired" });
+    }
+
+    if (stored.otp !== otp) {
+      return res.status(400).json({ verified: false, error: "Invalid OTP" });
+    }
+
+    delete global.twilioOtps[identifier];
+    const fullPhoneNumber = `+${String(countryCode).replace(/\D/g, "")}${phoneNumber.replace(/\D/g, "")}`;
+
+    res.json({
+      verified: true,
+      accessToken: makeTwilioOtpToken(identifier),
+      phoneNumber: fullPhoneNumber,
+      message: "OTP verified successfully"
     });
-    const data = await response.json().catch(() => ({}));
-    assertMsg91Success(response, data, "MSG91 OTP verification failed");
-    if (data.message && !String(data.message).toLowerCase().includes("verified")) {
-      return res.status(400).json({ verified: false, error: data.message, data });
-    }
-    res.json({ verified: true, accessToken: makeSignupOtpToken(identifier), data });
   } catch (err) {
-    console.error("MSG91 OTP verification failed:", err);
-    res.status(err.status || 500).json({ verified: false, error: err.message || "MSG91 OTP verification failed" });
+    console.error("Twilio OTP verification failed:", err);
+    res.status(500).json({ verified: false, error: err.message || "Twilio OTP verification failed" });
   }
 });
 
-app.post("/otp/msg91/verify-token", async (req, res) => {
+// Legacy Twilio endpoints (for backward compatibility)
+const makeTwilioSignupOtpToken = (identifier) =>
+  signJwt({ scope: "twilio-phone-otp", identifier }, 10 * 60);
+
+const verifyTwilioSignupOtpToken = async (token, countryCode, phone) => {
+  const identifier = `${String(countryCode || "+1").replace(/\D/g, "")}${String(phone || "").replace(/\D/g, "")}`;
   try {
-    const accessToken = String((req.body && (req.body.accessToken || req.body["access-token"])) || "").trim();
-    if (!accessToken) {
-      return res.status(400).json({ verified: false, error: "MSG91 access token is required" });
+    const payload = verifyJwt(token);
+    if (payload.scope !== "twilio-phone-otp" || payload.identifier !== identifier) {
+      throw new Error("OTP verification does not match this phone number");
     }
-    const data = await verifyMsg91AccessToken(accessToken);
-    res.json({ verified: true, data });
+    return payload;
   } catch (err) {
-    console.error("MSG91 access token verification failed:", err);
-    res.status(err.status || 500).json({ verified: false, error: err.message || "MSG91 token verification failed" });
+    throw err;
+  }
+};
+
+app.post("/otp/twilio/send", async (req, res) => {
+  try {
+    if (!twilioClient) {
+      return res.status(500).json({ error: "Twilio is not configured. Please add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_PHONE_NUMBER to .env" });
+    }
+    const phoneNumber = String((req.body && req.body.phoneNumber) || "").trim();
+    const countryCode = String((req.body && req.body.countryCode) || "+1").trim();
+
+    if (!phoneNumber || !/^\d{7,15}$/.test(phoneNumber.replace(/\D/g, ""))) {
+      return res.status(400).json({ error: "A valid phone number is required" });
+    }
+
+    const fullPhoneNumber = `+${String(countryCode).replace(/\D/g, "")}${phoneNumber.replace(/\D/g, "")}`;
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+    try {
+      await twilioClient.messages.create({
+        body: `Your Vybera OTP is: ${otp}. This code will expire in 10 minutes.`,
+        from: twilioPhoneNumber,
+        to: fullPhoneNumber,
+      });
+
+      // Store OTP in memory (in production, use a database or cache like Redis)
+      if (!global.twilioOtps) global.twilioOtps = {};
+      const identifier = `${String(countryCode).replace(/\D/g, "")}${phoneNumber.replace(/\D/g, "")}`;
+      global.twilioOtps[identifier] = {
+        otp,
+        expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes
+      };
+
+      res.json({
+        sent: true,
+        phoneNumber: fullPhoneNumber,
+        message: "OTP sent successfully"
+      });
+    } catch (twilioErr) {
+      console.error("Twilio send failed:", twilioErr);
+      res.status(500).json({
+        sent: false,
+        error: twilioErr.message || "Failed to send OTP via Twilio"
+      });
+    }
+  } catch (err) {
+    console.error("Twilio OTP send error:", err);
+    res.status(500).json({ sent: false, error: err.message || "Twilio OTP send failed" });
+  }
+});
+
+app.post("/otp/twilio/verify", async (req, res) => {
+  try {
+    if (!twilioClient) {
+      return res.status(500).json({ verified: false, error: "Twilio is not configured" });
+    }
+
+    const phoneNumber = String((req.body && req.body.phoneNumber) || "").trim();
+    const countryCode = String((req.body && req.body.countryCode) || "+1").trim();
+    const otp = String((req.body && req.body.otp) || "").trim();
+
+    if (!phoneNumber || !/^\d{7,15}$/.test(phoneNumber.replace(/\D/g, ""))) {
+      return res.status(400).json({ verified: false, error: "A valid phone number is required" });
+    }
+
+    if (!/^\d{6}$/.test(otp)) {
+      return res.status(400).json({ verified: false, error: "OTP must be 6 digits" });
+    }
+
+    const identifier = `${String(countryCode).replace(/\D/g, "")}${phoneNumber.replace(/\D/g, "")}`;
+
+    if (!global.twilioOtps || !global.twilioOtps[identifier]) {
+      return res.status(400).json({ verified: false, error: "OTP not found. Please request a new OTP" });
+    }
+
+    const stored = global.twilioOtps[identifier];
+
+    if (Date.now() > stored.expiresAt) {
+      delete global.twilioOtps[identifier];
+      return res.status(400).json({ verified: false, error: "OTP has expired" });
+    }
+
+    if (stored.otp !== otp) {
+      return res.status(400).json({ verified: false, error: "Invalid OTP" });
+    }
+
+    delete global.twilioOtps[identifier];
+    const fullPhoneNumber = `+${String(countryCode).replace(/\D/g, "")}${phoneNumber.replace(/\D/g, "")}`;
+
+    res.json({
+      verified: true,
+      accessToken: makeTwilioOtpToken(identifier),
+      phoneNumber: fullPhoneNumber,
+      message: "OTP verified successfully"
+    });
+  } catch (err) {
+    console.error("Twilio OTP verification failed:", err);
+    res.status(500).json({ verified: false, error: err.message || "Twilio OTP verification failed" });
   }
 });
 
@@ -2607,7 +2716,13 @@ app.post("/signup", async (req, res) => {
     if (!otpAccessToken) {
       return res.status(400).json({ error: "Please verify your phone number with OTP before creating an account" });
     }
-    await verifySignupOtpToken(otpAccessToken, cleanCountryCode, cleanPhone);
+
+    // Verify with Twilio OTP token
+    try {
+      await verifyTwilioSignupOtpToken(otpAccessToken, cleanCountryCode, cleanPhone);
+    } catch (err) {
+      return res.status(400).json({ error: "OTP verification failed. Please verify your phone number again." });
+    }
 
     const hashedPassword = await bcrypt.hash(password, 10);
     const displayName = [cleanFirstName, cleanLastName].filter(Boolean).join(" ");
@@ -2795,6 +2910,9 @@ app.get("/session", async (req, res) => {
   }
 });
 
+app.use("/uploads", express.static(uploadsDir));
+app.use(express.static(path.join(__dirname)));
+app.use("/VYBERA", express.static(path.join(__dirname)));
 
 const PORT = process.env.PORT || 3003;
 
